@@ -1,31 +1,74 @@
-# QQ 官方机器人 MCP + HTTP 云桥
+# QQ 官方机器人 MCP 云桥
 
-把 QQ 官方机器人连接到你自己的 Agent。云端单容器保持 WebSocket 连接，SQLite 保存消息、成员资料和发送记录；Agent 使用远程 MCP 或 HTTP 获取消息、浏览对话、发送文字和富媒体。
+**让任何 Agent 住进 QQ。**
 
-## 功能
+一个容器，同时暴露远程 MCP 和 HTTP API。云端常驻官方 WebSocket，把你的 Agent 变成真正能在 QQ 私聊和群聊里说话的机器人——收发文字、图片、视频、语音、文件，知道谁在说话、在哪个群、还能不能回复。
 
-- **媒体直链发送**：给 MCP 传 `media_url` + `media_kind`，QQ 平台下载转存并发送图片、MP4、语音或文件。
-- **文件上传发送**：本地文件可用 HTTP multipart（默认 20MiB），小文件可用 MCP Base64（4MiB）。
-- **发言人资料**：自动保存官方事件中的昵称、角色、头像等可用字段，按会话维护资料缓存。
-- **主动联系**：配置会话授权后，Agent 可主动给用户/群发送消息。
-- **回复状态**：每条消息提供回复截止时间、剩余时间、剩余次数和主动联系授权状态。
-- **双向历史**：同时浏览收到的消息和机器人成功发送的内容。
-- **发送诊断**：查看排队、上传、发送阶段与最终结果。
-- 同端口 MCP `/mcp`、HTTP `/v1/*`、存活检查 `/health`；保留可分发 Skill。
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6E56CF)
+![Tools](https://img.shields.io/badge/tools-12-2ea44f)
+![Tests](https://img.shields.io/badge/tests-99%20passed-2ea44f)
+![Deploy](https://img.shields.io/badge/deploy-single%20container-0b7285)
+![Official](https://img.shields.io/badge/route-official%20Bot%20API-e8590c)
 
-## 部署
+```text
+QQ 用户  ←→  QQ 开放平台  ←→  这个容器  ←→  你的 Agent
+            官方 WebSocket      MCP / HTTP      心跳自己定
+```
 
-详细步骤见 [cloady 部署](docs/DEPLOY_CLOADY.md)，升级步骤见 [本轮升级](docs/UPGRADE.md)。
+本地不用跑任何守护进程。Agent 只要有心跳，就能主动巡查、主动开口。
 
-1. 在 QQ 官方平台创建机器人，取得 AppID/AppSecret，接收方式选择 WebSocket。
-2. 将仓库部署至 cloady，Compose 文件为根目录 `docker-compose.yml`。单服务 `bridge`，端口 8080，单副本。
-3. 在平台私密环境配置 `QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`BRIDGE_API_TOKEN`，将实际 HTTPS 域名加入 `BRIDGE_ALLOWED_HOSTS`。
-4. 命名卷 `qqbot-data` 挂载 `/data`，保留旧卷进行升级。容器 UID/GID 10001，卷需要该用户可写。
-5. 浏览 `/health`，接入 MCP 后调用 `qq_status` 查看 QQ 状态。
+---
 
-镜像运行 `uvicorn bridge.main:app --host 0.0.0.0 --port 8080 --workers 1`。通过平台 HTTPS 域名访问；若自己使用 Compose，端口映射所有网卡，应由 HTTPS 代理/防火墙控制公网访问。
+## 为什么不是又一个 Bot 框架
 
-## Agent 接入
+| | 常见做法 | 这个项目 |
+|---|---|---|
+| 协议 | 逆向客户端协议 | 腾讯官方 Bot API v2 |
+| Agent 位置 | 塞进 Bot 进程里 | 独立进程，通过 MCP 调用 |
+| 本地负担 | 常驻脚本 + 掉线重连 | 一个容器，云端常驻 |
+| 多端复用 | 每个 Bot 一套代码 | 一个 MCP 端点，接几个 Agent 都行 |
+| 媒体发送 | 自己拼 Base64 | 给个 URL，平台自己取 |
+| 失败排查 | 一个 400，全靠猜 | 官方业务码 + 阶段定位 |
+
+---
+
+## 能力
+
+| 能力 | 说明 |
+|---|---|
+| 私聊 / 群聊收发 | 文字、图片、视频、语音、文件 |
+| 主动联系 | 不用等你先说话，Agent 可以主动找你 |
+| 认识人 | 昵称、头像、群内角色；同名靠 ID 区分 |
+| 认识群 | 群名称、群人数、群成员列表 |
+| 双向历史 | 谁说过什么，双向可查，游标独立 |
+| 媒体直链 | `media_url` 一句话发视频，不用 Base64 |
+| 自动回退 | 平台抓不到链接，桥自己下载后分片上传 |
+| 精确诊断 | 850026 是下载失败，850019 是格式不支持 |
+| 省流返回 | 单条消息 378 字符，是原始结构的 24% |
+
+表情和 @ 会被翻译成人话：`<faceType=1,...>` → `[表情:大怨种]`，`<@9A30...>` → `[@Coconut]`。
+
+---
+
+## 30 秒开始
+
+**1. 建机器人**
+
+到 [QQ 开放平台](https://q.qq.com/#/apps) 创建机器人，拿 AppID 和 AppSecret，事件接收方式选 **WebSocket**。
+
+**2. 部署**
+
+```bash
+git clone https://github.com/Komorebi-zyd/qq_bot_bridge
+cd qq_bot_bridge
+cp .env.example .env    # 填 AppID / AppSecret / BRIDGE_API_TOKEN
+docker compose up -d --build
+```
+
+单服务、单容器、单副本。持久数据在命名卷 `qqbot-data`。
+
+**3. 接入 Agent**
 
 ```text
 类型：Streamable HTTP
@@ -33,92 +76,154 @@ URL：https://你的域名/mcp
 请求头：Authorization: Bearer <BRIDGE_API_TOKEN>
 ```
 
-`/mcp` 与 `/mcp/` 都可直接使用。MCP 使用官方 Python SDK `mcp==1.30.0`，QQ SDK 固定 `qqbot-agent-sdk==1.2.2`。
+刷新工具列表，看到 12 个 `qq_*` 工具就通了。先调 `qq_status` 确认 QQ 在线。
+
+详细步骤见 [cloady 部署](docs/DEPLOY_CLOADY.md)。
+
+---
+
+## MCP 工具
 
 | 工具 | 用途 |
 |---|---|
-| qq_status | 在线状态和队列诊断 |
-| qq_get_capabilities | 媒体能力、限额、回复规则及主动配置 |
-| qq_get_messages | 游标读取新消息，附发言人资料和回复状态 |
-| qq_ack_message | 标记消息已处理 |
-| qq_list_sessions | 浏览会话、名称与主动联系状态 |
-| qq_get_session_messages | 浏览会话收到的消息 |
-| qq_get_session_history | 浏览收发双向历史 |
-| qq_get_profiles | 按会话筛选成员资料 |
-| qq_get_profile | 查询某位发言人的缓存资料 |
-| qq_send_message | 文字、媒体 URL 或已上传文件发送 |
-| qq_get_send_result | 查询发送阶段与结果 |
-| qq_upload_media | 上传小文件，取得 media_id |
+| `qq_status` | 在线状态、队列深度、最近诊断 |
+| `qq_get_capabilities` | 可用场景、回复时限、媒体限额 |
+| `qq_get_messages` | 游标拉新消息 |
+| `qq_ack_message` | 标记已处理 |
+| `qq_list_sessions` | 会话、群名、成员 |
+| `qq_get_session_messages` | 单会话消息 |
+| `qq_get_session_history` | 双向收发记录 |
+| `qq_get_profiles` | 按会话筛成员资料 |
+| `qq_get_profile` | 单个成员资料 |
+| `qq_send_message` | 发文字 / URL 媒体 / 已上传文件 |
+| `qq_get_send_result` | 查询发送阶段与结果 |
+| `qq_upload_media` | 上传小文件换 media_id |
 
-MCP description 采用简洁的正向能力说明。工具默认返回 `detail=lite` 精简结构（纯文字消息约 378 字符，比原始字段少 76%），需要排查时传 `detail=full` 取原始归档。完整接口见 [docs/API.md](docs/API.md)。
+所有工具默认 `detail=lite`，需要原始字段时传 `detail=full`。
 
-### URL 媒体回复
+---
+
+## 用起来是什么样
+
+**回一句话**
 
 ```json
 {
-  "idempotency_key": "video-reply-123-v1",
-  "reply_to": 123,
-  "text": "这是视频",
-  "media_url": "https://cdn.example.com/example.mp4",
-  "media_kind": "video",
-  "filename": "example.mp4"
+  "idempotency_key": "reply-42-v1",
+  "reply_to": 42,
+  "text": "收到，马上处理"
 }
 ```
 
-图片 `image`、视频 `video`、语音 `voice`、文件 `file`。一次一份媒体，可附文字。QQ 平台从公网 HTTPS 直链下载转存；模型只提交 URL，URL 应是文件本身而非网页/网盘预览页。
-
-平台抓不到链接时会返回业务码 850026。桥随即按官方建议自行下载一次并改用分片上传重试，因此源站限制反爬时也能发出；两者都失败时 `error` 会说明原因。发送结果里的 `error_details` 保留官方业务码，`error` 给出对应含义。
-
-### 主动联系
-
-设置精确会话：
-
-```dotenv
-BRIDGE_PROACTIVE_SESSIONS=c2c:用户OpenID,group:群OpenID
-```
-
-调用示例：
+**发一段视频**
 
 ```json
-{"idempotency_key":"reminder-unique-v1","scene":"c2c","chat_id":"用户OpenID","text":"提醒内容"}
+{
+  "idempotency_key": "video-42-v1",
+  "reply_to": 42,
+  "media_url": "https://cdn.example.com/demo.mp4",
+  "media_kind": "video",
+  "filename": "demo.mp4",
+  "text": "这是你要的视频"
+}
 ```
 
-Agent 宿主的 heartbeat 负责唤醒 Agent，由 Agent 判断发言时机并调用工具。服务器授权、QQ 客户端允许主动发送、官方实际权限/频率共同决定结果。主动消息默认只向显式配置的会话开放。
+**主动找人**
 
-### 昵称与资料
+```json
+{
+  "idempotency_key": "reminder-001",
+  "scene": "c2c",
+  "chat_id": "用户的 openid",
+  "text": "该喝水了"
+}
+```
 
-群会话会调用官方群信息接口缓存群名、简介、分类与人数（该接口为白名单能力，无权限时标记为不可用）。桥自动保存 `author.username` 等官方提供的字段，并使用稳定 ID 区分同名用户。消息中的 sender 是当时的资料快照，缓存资料供后续查询。QQ 号码只有来源明确时才作为独立资料处理；OpenID、union_openid、union_user_account 都不自动解释成 QQ 号。独立查询群成员接口属于官方内邀能力，基础版本从事件自动积累资料。
+**拉回来的消息长这样**
 
-## 回复规则
+```json
+{
+  "seq": 13,
+  "text": "[表情:大怨种]",
+  "from": { "id": "59F5…", "name": "蝉", "role": "member", "avatar": "https://…" },
+  "at": "2026-11-13T20:43:22+08:00",
+  "can_reply": true,
+  "replies_left": 5,
+  "reply_deadline": "2026-11-13T12:48:22+00:00"
+}
+```
 
-| 场景 | 默认有效期 | 每条原消息默认可预留回复数 |
-|---|---|---|
-| C2C 私聊 | 3600 秒 | 4 |
-| 群聊 | 300 秒 | 5 |
-| 频道/频道私信 | 300 秒 | 桥端保护上限 5 |
+Agent 拿到就能判断：谁说的、说了什么、还来不来得及回。
 
-C2C 与群聊数值依据当前官方[消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。频道 5 次是桥端策略，不是官方承诺。配置可以收紧，最终以平台实际受理为准。原始 timestamp 用于计算窗口，队列及上传后会再次核对。旧消息升级后按当前规则计算回复状态。
+---
 
-## 数据与运行约定
+## 几个刻意的设计
 
-- `/v1/messages` 和旧会话 messages API 的 seq 始终对应入站消息；双向 history 使用独立 `history_seq`，分别保存游标。
-- 发送动作使用稳定 idempotency_key。`queued` 为入队，`sent` 为平台受理，`unknown` 需核实后决定后续动作。同一动作沿用同一 key 查询结果。
-- SQLite 以 additive 迁移保留旧消息、发送、上传及网关 session；迁移前建议平台卷快照/SQLite backup。单副本、单 worker。
-- 已提交归档随卷保留；平台休眠或网关断线期间事件恢复取决于官方。资料和旧历史的字段丰富度取决于当时实际保存的数据。
-- 主动权限与 QQ 服务范围是独立配置；单聊与群成员 OpenID 按各场景处理。
-- Bearer token 保存在平台 Secret/Agent 私密配置。签名媒体 URL 可能包含访问令牌，日志与错误仅保留脱敏诊断。
-- 单机器人、共享密钥架构适合互信 Agent；多租户需要独立鉴权与数据隔离。
+**回复额度按平台规则记账。** 私聊 60 分钟 4 次、群聊 5 分钟 5 次。每次回复占一个持久化的 `msg_seq`，重启不丢，不会因为并发把额度算超。
 
-## 配置与测试
+**发送是幂等的。** 一个业务动作一个 `idempotency_key`。超时了拿同一个 key 查结果，不会重复发。结果不确定时标 `unknown` 等你核实，不自动重发。
 
-`.env.example` 列出部署参数。数值可选项对空值/空白使用默认值，配置错误报告变量名。上传文件默认 20MiB、总请求 21MiB、本地媒体总保留 256MiB、TTL 24h；MCP 内联上传 4MiB。`BRIDGE_MEDIA_URL_HOSTS` 可限制为逗号分隔的精确媒体域名，空值表示校验公网 HTTPS 地址。
+**媒体走平台原生 URL 上传。** 模型只提交直链，QQ 服务器自己取文件。平台取不到（850026）时，桥下载一份走分片上传再试一次——官方文档推荐的做法。
 
-```powershell
+**返回只给该给的。** `sender` 和 `sender_profile` 合并成一个 `from`，`message_id` 不返回（回复用 `seq`），空字段不输出，秒级倒计时换成绝对截止时间。一条消息从 1516 字符压到 378。
+
+**MCP 结果不重复。** 关掉结构化镜像，一份 JSON 只出现一次。
+
+---
+
+## 配置
+
+| 变量 | 说明 |
+|---|---|
+| `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | 官方机器人凭据 |
+| `BRIDGE_API_TOKEN` | 桥的访问密钥，建议 32 字节随机 |
+| `BRIDGE_ALLOWED_HOSTS` | MCP 允许的 Host，精确匹配 |
+| `BRIDGE_ALLOWED_ORIGINS` | 浏览器 Origin 白名单 |
+| `BRIDGE_PROACTIVE_DENY` | 主动发送黑名单，留空即全开 |
+| `BRIDGE_MEDIA_URL_HOSTS` | 限定媒体域名，留空即公网 |
+| `BRIDGE_GROUP_FULL_MESSAGES` | 群全量消息，需平台权限 |
+| `BRIDGE_REPLY_WINDOW_C2C` 等 | 分场景回复窗口 |
+| `BRIDGE_MAX_REPLIES_C2C` 等 | 分场景回复次数 |
+
+完整清单见 [.env.example](.env.example)。
+
+---
+
+## 附带 Skill
+
+`skills/qq-official-bridge/` 是给 Agent 直接用的技能包，MCP 优先、HTTP 与一次性 CLI 兜底。打包版在 `dist/qq-official-bridge.skill`。
+
+CLI 只用标准库，跑完就退出：
+
+```bash
+python scripts/qq_bridge.py capabilities
+python scripts/qq_bridge.py inbox --after 0 --limit 20
+python scripts/qq_bridge.py send --reply-to 42 --media-url https://cdn.example.com/a.png --kind image --key img-42
+```
+
+---
+
+## 本地开发
+
+```bash
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements-dev.txt
 .venv\Scripts\python -m pytest -q
 ```
 
-测试注入 fake QQ 后端并包含官方 MCP 客户端 loopback 测试。真实 QQ 媒体/群昵称/主动发送在云端升级后验收，见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+99 项离线测试，覆盖官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、错误码解析、标记清洗。不需要真实凭据，不向 QQ 发消息。
 
-Skill 保留在 `skills/qq-official-bridge/`，分发包为 `dist/qq-official-bridge.skill`。
+---
+
+## 边界
+
+- 只呈现官方事件推送到桥的会话，不是个人 QQ 的全量历史。
+- 身份标识是 OpenID，不是 QQ 号；官方不给可逆映射。
+- 群名走官方群信息接口，走一次缓存一次。
+- 平台侧的权限、配额、内容规则由 QQ 决定，桥只负责准确传达结果。
+
+---
+
+## License
+
+MIT
