@@ -1,0 +1,30 @@
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8080:8080"
+    environment:
+      QQBOT_APP_ID: ${QQBOT_APP_ID:?QQBOT_APP_ID is required}
+      QQBOT_APP_SECRET: ${QQBOT_APP_SECRET:?QQBOT_APP_SECRET is required}
+      BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN:?BRIDGE_API_TOKEN is required}
+      BRIDGE_DATA_DIR: /data
+      BRIDGE_ALLOWED_HOSTS: ${BRIDGE_ALLOWED_HOSTS:-localhost:8080,127.0.0.1:8080,[::1]:8080}
+      BRIDGE_ALLOWED_ORIGINS: ${BRIDGE_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080,http://[::1]:8080}
+      BRIDGE_PROACTIVE_SESSIONS: ${BRIDGE_PROACTIVE_SESSIONS:-}
+      BRIDGE_GROUP_FULL_MESSAGES: ${BRIDGE_GROUP_FULL_MESSAGES:-false}
+      BRIDGE_MAX_MEDIA_BYTES: ${BRIDGE_MAX_MEDIA_BYTES:-268435456}
+    volumes:
+      - type: volume
+        source: qqbot-data
+        target: /data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    stop_grace_period: 30s
+volumes:
+  qqbot-data:
+    name: qqbot-data

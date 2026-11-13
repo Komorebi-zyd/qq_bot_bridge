@@ -1,0 +1,177 @@
+"""Only fake QQ backend; real official MCP client over ephemeral loopback HTTP."""
+import asyncio
+import base64
+import socket
+
+import httpx
+import pytest
+import uvicorn
+from fastapi.testclient import TestClient
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+from bridge.core import Settings, iso
+from bridge.mcp_server import MAX_INLINE_MEDIA, create_combined_app
+
+TOKEN = 'offline-test-token-0123456789'
+AUTH = {'Authorization': 'Bearer ' + TOKEN}
+TOOLS = {'qq_status', 'qq_get_messages', 'qq_ack_message', 'qq_list_sessions',
+         'qq_get_session_messages', 'qq_send_message', 'qq_get_send_result', 'qq_upload_media'}
+
+
+class Fake:
+    connected = api_ready = True
+    reconnecting = False
+
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+    async def close(self):
+        self.closed = True
+
+    async def send(self, body, route):
+        self.calls.append((body, route))
+        return {'id': 'fake-only'}
+
+
+def make_app(tmp_path, monkeypatch, host='testserver'):
+    monkeypatch.setenv('BRIDGE_ALLOWED_HOSTS', host)
+    monkeypatch.setenv('BRIDGE_ALLOWED_ORIGINS', 'https://agent.example')
+    fake = Fake()
+    app = create_combined_app(Settings(data=tmp_path, token=TOKEN, send_interval=0), fake)
+    return app, fake
+
+
+@pytest.mark.parametrize('method', ['GET', 'POST', 'DELETE', 'OPTIONS', 'PUT'])
+@pytest.mark.parametrize('path', ['/mcp', '/mcp/'])
+def test_transport_auth_all_methods(tmp_path, monkeypatch, method, path):
+    app, fake = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get('/health').status_code == 200
+        for headers in ({}, {'Authorization': 'Bearer wrong'}):
+            r = client.request(method, path, headers=headers, content=b'not-json')
+            assert r.status_code == 401
+            assert r.headers['www-authenticate'] == 'Bearer'
+        assert client.post('/mcp?token=' + TOKEN, json={}).status_code == 401
+        assert client.get('/v1/status').status_code == 401
+        assert client.get('/missing').status_code == 401
+    assert fake.closed
+
+
+def test_limits_hosts_slashes(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    with TestClient(app, headers=AUTH) as client:
+        for path in ('/mcp', '/mcp/'):
+            r = client.get(path, headers={'Accept': 'text/event-stream'}, follow_redirects=False)
+            assert r.status_code == 405  # stateless GET deliberately unsupported
+            assert 'location' not in r.headers
+        assert client.post('/mcp', content='{}', headers={'Content-Length': str(22*1024*1024)}).status_code == 413
+        body = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-03-26', 'capabilities': {}, 'clientInfo': {'name': 'test', 'version': '1'}}}
+        headers = {'Accept': 'application/json, text/event-stream', 'Host': 'evil.example'}
+        assert client.post('/mcp', json=body, headers=headers).status_code == 421
+        headers['Host'] = 'testserver'
+        headers['Origin'] = 'https://evil.example'
+        assert client.post('/mcp', json=body, headers=headers).status_code == 403
+
+
+def test_exact_allowlist_required(tmp_path, monkeypatch):
+    monkeypatch.setenv('BRIDGE_ALLOWED_HOSTS', '*.example.com')
+    with pytest.raises(RuntimeError, match='explicit'):
+        create_combined_app(Settings(data=tmp_path, token=TOKEN), Fake())
+
+
+def test_official_client_full_parity(tmp_path, monkeypatch):
+    async def scenario():
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        host = f'127.0.0.1:{sock.getsockname()[1]}'
+        app, fake = make_app(tmp_path, monkeypatch, host)
+        attachment = {'url': 'https://cdn.example/real.png', 'voice_wav_url': 'https://cdn.example/voice.wav'}
+        seq = app.state.store.observe(dict(message_id='incoming', scene='c2c', chat_id='user',
+            user_id='user', content='hello', attachments=[attachment], timestamp=iso()))
+        server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False))
+        task = asyncio.create_task(server.serve(sockets=[sock]))
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                if task.done():
+                    await task
+                await asyncio.sleep(.01)
+            assert server.started
+            async with httpx.AsyncClient(headers=AUTH, timeout=10) as http:
+                async with streamable_http_client(f'http://{host}/mcp', http_client=http) as (read, write, session_id):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        assert session_id() is None
+                        tools = await session.list_tools()
+                        assert {t.name for t in tools.tools} == TOOLS
+
+                        async def call(name, args=None):
+                            result = await session.call_tool(name, args or {})
+                            assert not result.isError, result
+                            return result.structuredContent
+
+                        assert await call('qq_status') == (await http.get(f'http://{host}/v1/status')).json()
+                        messages = await call('qq_get_messages', {'after': 0, 'limit': 1, 'scene': 'c2c', 'chat_id': 'user'})
+                        assert messages == (await http.get(f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user')).json()
+                        assert messages['items'][0]['attachments'] == [attachment]
+                        assert await call('qq_get_session_messages', {'scene': 'c2c', 'chat_id': 'user'}) == messages
+                        assert (await call('qq_list_sessions'))['items'][0]['chat_id'] == 'user'
+                        assert (await call('qq_ack_message', {'seq': seq}))['acked']
+                        uploaded = await call('qq_upload_media', {'filename': 'tiny.png', 'content_base64': base64.b64encode(b'fake-image').decode()})
+                        assert uploaded['size'] == 10
+                        send = dict(idempotency_key='mcp-turn', text='reply', reply_to=seq,
+                            media_id=uploaded['media_id'], media_kind='image')
+                        assert (await call('qq_send_message', send))['idempotency_key'] == 'mcp-turn'
+                        for _ in range(100):
+                            record = await call('qq_get_send_result', {'key': 'mcp-turn'})
+                            if record['status'] == 'sent':
+                                break
+                            await asyncio.sleep(.02)
+                        assert record['status'] == 'sent'
+                        assert (await http.get(f'http://{host}/v1/sends/mcp-turn')).json() == record
+                        assert (await call('qq_send_message', send)) == record
+                        assert len(fake.calls) == 1
+                        invalid = [
+                            ('qq_get_messages', {'limit': 201}),
+                            ('qq_send_message', {**send, 'text': 'different'}),
+                            ('qq_send_message', {'idempotency_key': 'denied', 'scene': 'c2c', 'chat_id': 'elsewhere', 'text': 'no'}),
+                            ('qq_upload_media', {'filename': 'x', 'content_base64': 'invalid!'}),
+                            ('qq_upload_media', {'filename': 'x', 'content_base64': ''}),
+                            ('qq_upload_media', {'filename': 'x', 'content_base64': base64.b64encode(b'x' * (MAX_INLINE_MEDIA + 1)).decode()}),
+                        ]
+                        for name, args in invalid:
+                            result = await session.call_tool(name, args)
+                            assert result.isError, (name, result)
+                            if name == 'qq_upload_media':
+                                assert 'invalid!' not in str(result.content)
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, 10)
+            sock.close()
+        assert fake.closed
+    asyncio.run(scenario())
+
+
+def test_chunked_mcp_limit(tmp_path, monkeypatch):
+    async def scenario():
+        app, _ = make_app(tmp_path, monkeypatch)
+        # Keep the test small but exercise the same no-Content-Length path.
+        for middleware in app.user_middleware:
+            if middleware.cls.__name__ == 'RequestLimit':
+                middleware.kwargs['limit'] = 32
+        async def chunks():
+            yield b'x' * 20
+            yield b'x' * 20
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                    base_url='http://testserver', headers=AUTH) as client:
+                response = await client.post('/mcp', content=chunks())
+                assert response.status_code == 413
+    asyncio.run(scenario())
