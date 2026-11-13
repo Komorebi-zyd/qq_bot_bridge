@@ -26,8 +26,10 @@ UPLOAD_REASONS = {
     40093002: 'daily upload quota reached',
 }
 
-# Platform could not obtain the bytes itself; a local copy is worth trying.
-DOWNLOAD_FALLBACK_CODES = frozenset({850026, 850027, 10000})
+# Codes where the media itself was rejected, so retrying with our own copy is
+# pointless. Everything else (including codes not documented yet) is treated as
+# "the platform could not obtain the bytes" and gets one local retry.
+NON_RETRYABLE_CODES = frozenset({850018, 850019, 850031})
 
 CHUNK = 65536
 
@@ -39,7 +41,9 @@ class UploadError(Exception):
         self.status_code = status_code if type(status_code) is int else None
         self.bizcode = bizcode if type(bizcode) is int else None
         self.reason = UPLOAD_REASONS.get(self.bizcode)
-        self.can_retry_locally = self.bizcode in DOWNLOAD_FALLBACK_CODES or self.bizcode is None
+        if self.reason is None and self.bizcode is not None:
+            self.reason = f'platform rejected the upload (code {self.bizcode})'
+        self.can_retry_locally = self.bizcode not in NON_RETRYABLE_CODES
         super().__init__(self.reason or 'upload failed')
 
 

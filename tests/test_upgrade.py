@@ -366,3 +366,12 @@ def test_uploader_parses_platform_code(monkeypatch):
         raise AssertionError('expected UploadError')
     exc=aio.run(scenario())
     assert exc.status_code==400 and exc.bizcode==850026 and exc.can_retry_locally
+
+
+def test_undocumented_upload_code_still_retries_locally():
+    from bridge.uploader import UploadError
+    exc=UploadError(400, 40093007)
+    assert exc.can_retry_locally
+    assert '40093007' in exc.reason
+    for code in (850019, 850031, 850018):
+        assert not UploadError(400, code).can_retry_locally
