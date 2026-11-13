@@ -67,12 +67,12 @@ def attach_mcp(app):
             raise ToolError(f'HTTP {response.status_code}: {safe}')
         return response.json()
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_status() -> dict[str, Any]:
         """查看 QQ 在线状态、发送队列统计和最近运行诊断。"""
         return await request('GET', '/v1/status')
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_messages(after: int = 0, limit: int = 20, scene: Scene | None = None,
             chat_id: str | None = None, detail: Detail = 'lite') -> dict[str, Any]:
         """按游标读取新消息，含发言人、正文、附件链接与回复状态。after 为上次 next_cursor。detail=lite 精简，full 返回原始字段。"""
@@ -80,24 +80,24 @@ def attach_mcp(app):
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id}.items() if v is not None})
         return await request('GET', '/v1/messages', params=params)
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_ack_message(seq: int) -> dict[str, Any]:
         """将 seq 对应的消息标记为已处理，返回确认状态。"""
         return await request('POST', f'/v1/messages/{seq}/ack')
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_list_sessions(detail: Detail = 'lite') -> dict[str, Any]:
         """列出会话、群名、成员与主动联系状态。"""
         return await request('GET', '/v1/sessions', params={'detail': detail})
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_session_messages(scene: Scene, chat_id: str, after: int = 0, limit: int = 20,
             detail: Detail = 'lite') -> dict[str, Any]:
         """分页读取指定会话收到的消息，含发言人、正文和附件链接。"""
         return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/messages',
                              params={'after': after, 'limit': limit, 'detail': detail})
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_send_message(idempotency_key: str, text: str = '', reply_to: int | None = None,
             scene: Scene | None = None, chat_id: str | None = None, media_id: str | None = None,
             media_kind: MediaKind | None = None, markdown: bool = False,
@@ -109,12 +109,12 @@ def attach_mcp(app):
             media_kind=media_kind, markdown=markdown, media_url=media_url, filename=filename),
             params={'detail': detail})
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_send_result(key: str, detail: Detail = 'lite') -> dict[str, Any]:
         """按发送动作的 key 查询阶段与最终状态；detail=full 附带平台原始返回。"""
         return await request('GET', '/v1/sends/' + quote(key, safe=''), params={'detail': detail})
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_upload_media(filename: str, content_base64: str) -> dict[str, Any]:
         """上传标准 Base64 编码的小文件（解码后最多 4MiB），返回可用于发送的 media_id。公网媒体直链可直接交给 qq_send_message。"""
         if len(content_base64) > 4 * ((MAX_INLINE_MEDIA + 2) // 3):
@@ -127,12 +127,12 @@ def attach_mcp(app):
             raise ToolError('inline media exceeds 4MiB; use REST multipart upload')
         return await request('POST', '/v1/media', files={'file': (filename, data, 'application/octet-stream')})
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_capabilities(detail: Detail = 'lite') -> dict[str, Any]:
         """查看可用场景、回复时限、媒体类型与上传限额。"""
         return await request('GET', '/v1/capabilities', params={'detail': detail})
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_profiles(scene: Scene | None = None, chat_id: str | None = None,
             user_id: str | None = None, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         """分页查看会话成员资料，包含昵称、角色及资料来源，可按场景、会话或发言人筛选。"""
@@ -140,12 +140,12 @@ def attach_mcp(app):
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id, 'user_id': user_id}.items() if v is not None})
         return await request('GET', '/v1/profiles', params=params)
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_profile(scene: Scene, chat_id: str, user_id: str) -> dict[str, Any]:
         """获取指定会话中一位发言人的昵称、身份角色和最新缓存资料。"""
         return await request('GET', f'/v1/profiles/{scene}/{quote(chat_id, safe="")}/{quote(user_id, safe="")}')
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def qq_get_session_history(scene: Scene, chat_id: str, after: int = 0, limit: int = 20,
             direction: Literal['all', 'in', 'out'] = 'all', detail: Detail = 'lite') -> dict[str, Any]:
         """分页浏览会话的双向记录，含收到与已发出的内容。after 使用历史 next_cursor。"""

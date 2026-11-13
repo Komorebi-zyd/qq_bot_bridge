@@ -1,6 +1,7 @@
 """Only fake QQ backend; real official MCP client over ephemeral loopback HTTP."""
 import asyncio
 import base64
+import json
 import socket
 
 import httpx
@@ -131,7 +132,9 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         async def call(name, args=None):
                             result = await session.call_tool(name, args or {})
                             assert not result.isError, result
-                            return result.structuredContent
+                            # Unstructured tools return one JSON text block.
+                            assert result.structuredContent is None
+                            return json.loads(result.content[0].text)
 
                         assert await call('qq_status') == (await http.get(f'http://{host}/v1/status')).json()
 
@@ -156,7 +159,7 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         assert uploaded['size'] == 10
                         send = dict(idempotency_key='mcp-turn', text='reply', reply_to=seq,
                             media_id=uploaded['media_id'], media_kind='image')
-                        assert (await call('qq_send_message', send))['idempotency_key'] == 'mcp-turn'
+                        assert (await call('qq_send_message', send))['key'] == 'mcp-turn'
                         for _ in range(100):
                             record = await call('qq_get_send_result', {'key': 'mcp-turn'})
                             if record['status'] == 'sent':
@@ -186,7 +189,7 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         monkeypatch.setattr(core, 'validate_public_media_url', public_url)
                         url_send = await call('qq_send_message', {'idempotency_key':'mcp-url-video', 'reply_to':seq,
                             'media_url':'https://cdn.qq.com/test.mp4', 'media_kind':'video', 'filename':'test.mp4'})
-                        assert url_send['idempotency_key'] == 'mcp-url-video'
+                        assert url_send['key'] == 'mcp-url-video'
                         for _ in range(100):
                             url_result = await call('qq_get_send_result', {'key':'mcp-url-video'})
                             if url_result['status'] == 'sent':

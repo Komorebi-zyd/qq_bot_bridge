@@ -740,7 +740,7 @@ def create_app(cfg=None, backend=None):
                 (body.idempotency_key,fp,encoded,'queued',now,now,None,None))
             store.db.execute('INSERT INTO send_routes VALUES(?,?,?,?)',(body.idempotency_key,route[0],route[1],body.reply_to))
             store.db.execute('INSERT INTO send_details VALUES(?,?,?,NULL)',(body.idempotency_key,'queued',count+1 if body.reply_to else None))
-        return JSONResponse(store.send_record(body.idempotency_key),202)
+        return JSONResponse(_send_view(store.send_record(body.idempotency_key),detail),202)
 
     @api.get('/sends/{key}')
     async def send_status(key: str,detail: Detail='full'):
