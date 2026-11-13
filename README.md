@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6E56CF)
 ![Tools](https://img.shields.io/badge/tools-12-2ea44f)
-![Tests](https://img.shields.io/badge/tests-99%20passed-2ea44f)
+![Tests](https://img.shields.io/badge/tests-88%20passed-2ea44f)
 ![Deploy](https://img.shields.io/badge/deploy-single%20container-0b7285)
 ![Official](https://img.shields.io/badge/route-official%20Bot%20API-e8590c)
 
@@ -189,19 +189,19 @@ Agent 拿到就能判断：谁说的、说了什么、还来不来得及回。
 
 ---
 
-## 附带 Skill
+## 直接用 HTTP
 
-`skills/qq-official-bridge/` 是给 Agent 直接用的技能包，MCP 优先、HTTP 与一次性 CLI 兜底。打包版在 `dist/qq-official-bridge.skill`。
-
-CLI 只用标准库，跑完就退出：
+不想接 MCP 也能用，REST 与 MCP 共享同一套鉴权、存储和发送队列。
 
 ```bash
-python scripts/qq_bridge.py capabilities
-python scripts/qq_bridge.py inbox --after 0 --limit 20
-python scripts/qq_bridge.py send --reply-to 42 --media-url https://cdn.example.com/a.png --kind image --key img-42
+curl -H "Authorization: Bearer $TOKEN" https://你的域名/v1/messages?after=0&detail=lite
+curl -H "Authorization: Bearer $TOKEN" https://你的域名/v1/capabilities?detail=lite
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"reply-42","reply_to":42,"text":"收到"}' \
+  https://你的域名/v1/messages/send
 ```
 
----
+接口清单见 [docs/API.md](docs/API.md)。
 
 ## 本地开发
 
@@ -211,7 +211,7 @@ python -m venv .venv
 .venv\Scripts\python -m pytest -q
 ```
 
-99 项离线测试，覆盖官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、错误码解析、标记清洗。不需要真实凭据，不向 QQ 发消息。
+88 项离线测试，覆盖官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、错误码解析、标记清洗。不需要真实凭据，不向 QQ 发消息。
 
 ---
 

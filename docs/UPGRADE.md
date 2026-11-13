@@ -40,7 +40,7 @@ BRIDGE_PROACTIVE_SESSIONS=c2c:你自己的实际OpenID
 
 6. 访问 `/health`，然后调用 qq_status 和 qq_get_capabilities。
 7. 在 Agent 的 MCP 设置里刷新工具列表或重新连接；应看到 12 个工具、新的正向描述和 media_url 参数。
-8. 同步更新 Skill（若已安装），保留原心跳游标。
+8. 在 Agent 侧刷新工具列表，保留原心跳游标。
 
 ## 验收顺序
 

@@ -8,7 +8,6 @@
 - `python -m pip check`：No broken requirements found。
 - `git diff --check`：通过（Windows 行尾转换提示不影响结果）。
 - `docker compose config --quiet`：占位凭据与测试域名校验通过。
-- Skill 结构校验通过，重打包 `dist/qq-official-bridge.skill`，分发包排除了 Python 缓存。
 - 官方 MCP ClientSession + Streamable HTTP 客户端 loopback 集成：12 工具发现、正向 description、REST/MCP 一致性、新能力/资料/双向历史路由。
 - 四种媒体 URL 经过真实 SDK URL 上传函数及假 API，验证类型映射、srv_send_msg=false、富媒体DTO与持久化回复序号。
 - URL语法、私网/混合DNS答案、允许域名与敏感URL错误脱敏测试。
