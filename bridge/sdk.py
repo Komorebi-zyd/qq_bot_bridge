@@ -160,11 +160,34 @@ class OfficialBackend:
                 if isinstance(mention,dict):
                     uid = next((mention[k] for k in ('user_id','user_openid','member_openid','id') if mention.get(k)), '')
                     mentions.append({**self.store.identity(mention,uid),'source':'sdk_event'})
+        if event.chat_scope == 'group':
+            asyncio.create_task(self._load_group_info(event.chat_id))
         self.store.observe({'sender':sender,'mentions':mentions,'message_id':event.message_id,'scene':event.chat_scope,
             'chat_id':event.chat_id,'user_id':event.user_id,'content':event.content,
             'timestamp':event.timestamp,'attachments':attachments,'asr_text':asr,
             'msg_elements':json_safe(event.msg_elements),'message_reference':raw.get('message_reference'),
             'event_type':event_type})
+
+    async def _load_group_info(self, chat_id):
+        """Fetch the group name once per conversation.
+
+        The endpoint is documented as whitelist-only, so a rejection is cached as
+        unavailable instead of being retried on every message.
+        """
+        if self.store.group_info(chat_id) or not self.api:
+            return
+        try:
+            data = await asyncio.wait_for(
+                self.api.request(Route('GET','/v2/groups/{group_id}/info',group_id=chat_id)),15)
+        except Exception as exc:
+            self.store.report_error('group_info', exc)
+            self.store.set_group_info(chat_id, {'unavailable': True})
+            return
+        if not isinstance(data, dict):
+            self.store.set_group_info(chat_id, {'unavailable': True})
+            return
+        info = {k:data.get(k) for k in ('group_name','group_finger_memo','group_class_text','group_tags','group_member_num') if data.get(k) is not None}
+        self.store.set_group_info(chat_id, info or {'unavailable': True})
 
     def ready(self, ready):
         user = getattr(ready,'user',None)

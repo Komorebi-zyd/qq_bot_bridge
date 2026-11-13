@@ -87,7 +87,7 @@ Agent 宿主的 heartbeat 负责唤醒 Agent，由 Agent 判断发言时机并�
 
 ### 昵称与资料
 
-桥自动保存 `author.username` 等官方提供的字段，并使用稳定 ID 区分同名用户。消息中的 sender 是当时的资料快照，缓存资料供后续查询。QQ 号码只有来源明确时才作为独立资料处理；OpenID、union_openid、union_user_account 都不自动解释成 QQ 号。独立查询群成员接口属于官方内邀能力，基础版本从事件自动积累资料。
+群会话会调用官方群信息接口缓存群名、简介、分类与人数（该接口为白名单能力，无权限时标记为不可用）。桥自动保存 `author.username` 等官方提供的字段，并使用稳定 ID 区分同名用户。消息中的 sender 是当时的资料快照，缓存资料供后续查询。QQ 号码只有来源明确时才作为独立资料处理；OpenID、union_openid、union_user_account 都不自动解释成 QQ 号。独立查询群成员接口属于官方内邀能力，基础版本从事件自动积累资料。
 
 ## 回复规则
 

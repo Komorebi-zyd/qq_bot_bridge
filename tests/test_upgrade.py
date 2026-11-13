@@ -375,3 +375,56 @@ def test_undocumented_upload_code_still_retries_locally():
     assert '40093007' in exc.reason
     for code in (850019, 850031, 850018):
         assert not UploadError(400, code).can_retry_locally
+
+
+def test_group_info_cached_once(tmp_path):
+    import bridge.sdk as sdk
+    cfg=Settings(data=tmp_path,token=TOKEN)
+    store=Store(cfg); backend=sdk.OfficialBackend(store)
+    calls=[]
+    class API:
+        async def request(self,route):
+            calls.append('info')
+            return {'group_openid':'g','group_name':'读书分享会','group_finger_memo':'每周共读',
+                    'group_class_text':'文化','group_tags':['阅读'],'group_member_num':256,'secret':'ignore'}
+    backend.api=API()
+    async def scenario():
+        await backend._load_group_info('g')
+        await backend._load_group_info('g')
+    asyncio.run(scenario())
+    assert calls==['info']
+    info=store.group_info('g')
+    assert info['group_name']=='读书分享会' and info['group_member_num']==256
+    assert 'secret' not in info and 'group_openid' not in info
+    store.db.close()
+
+
+def test_group_info_unavailable_is_cached(tmp_path):
+    import bridge.sdk as sdk
+    cfg=Settings(data=tmp_path,token=TOKEN)
+    store=Store(cfg); backend=sdk.OfficialBackend(store)
+    calls=[]
+    class API:
+        async def request(self,route):
+            calls.append('info'); raise RuntimeError('QQ Bot API error [403] /v2/groups/x/info: no permission')
+    backend.api=API()
+    async def scenario():
+        await backend._load_group_info('g')
+        await backend._load_group_info('g')
+    asyncio.run(scenario())
+    assert calls==['info'] and store.group_info('g')=={'unavailable':True}
+    store.db.close()
+
+
+def test_sessions_include_group_info(tmp_path):
+    cfg=Settings(data=tmp_path,token=TOKEN,send_interval=0)
+    app=create_app(cfg,Fake())
+    with TestClient(app,headers=AUTH) as c:
+        store=app.state.store
+        store.observe(dict(message_id='g1',scene='group',chat_id='g',user_id='u',timestamp=iso()))
+        store.set_group_info('g',{'group_name':'读书分享会','group_member_num':12})
+        item=c.get('/v1/sessions').json()['items'][0]
+        assert item['group']['group_name']=='读书分享会'
+        store.observe(dict(message_id='c1',scene='c2c',chat_id='u',user_id='u',timestamp=iso()))
+        c2c=next(x for x in c.get('/v1/sessions').json()['items'] if x['scene']=='c2c')
+        assert 'group' not in c2c

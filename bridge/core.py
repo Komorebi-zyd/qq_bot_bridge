@@ -279,6 +279,14 @@ class Store:
         self.last_error = {'stage':stage,'class':name,'close_code':code}
         logging.getLogger(__name__).warning('bridge failure stage=%s class=%s close_code=%s', stage, name, code)
 
+    def group_info(self, chat):
+        row = self.db.execute("SELECT value FROM metadata WHERE namespace='group_info' AND key=?",(chat,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_group_info(self, chat, payload):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO metadata VALUES('group_info',?,?)",(chat,json.dumps(payload)))
+
     def get_session(self, app_id):
         row = self.db.execute("SELECT value FROM metadata WHERE namespace=? AND key='ws_session'", (app_id,)).fetchone()
         return tuple(json.loads(row[0])) if row else (None, None)
@@ -602,6 +610,9 @@ def create_app(cfg=None, backend=None):
         for (scene,chat), item in items.items():
             profiles = [json.loads(r[0]) for r in store.db.execute('SELECT payload FROM profiles WHERE scene=? AND chat_id=?',(scene,chat))]
             item.update(proactive_allowed=store.proactive(scene,chat),names=[dict(user_id=p['user_id'],username=p.get('username'),name_source=p.get('name_source','official_event')) for p in profiles])
+            if scene == 'group':
+                # Populated from the official group-info endpoint when permitted.
+                item['group'] = store.group_info(chat)
         return {'items':list(items.values())}
 
     @api.get('/sessions/{scene}/{chat_id}/messages')

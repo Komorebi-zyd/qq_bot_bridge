@@ -42,7 +42,7 @@ MCP description 聚焦功能与参数。以下约定解释状态、权限与游�
 
 ## 会话与双向历史
 
-`GET /v1/sessions` 返回会话统计、可用显示名称及 proactive_allowed。
+`GET /v1/sessions` 返回会话统计、可用显示名称及 proactive_allowed。群会话另带 `group`：桥在首次收到该群消息时调用官方 `/v2/groups/{group_openid}/info` 取群名、简介、分类、标签与人数并缓存；该接口为白名单能力，未获权限时 `group` 为 `{"unavailable": true}`。
 
 - 旧接口 `/v1/sessions/{scene}/{chat_id}/messages` 使用入站 `seq`，语义保持兼容。
 - 双向 `/v1/sessions/{scene}/{chat_id}/history?after=0&limit=50&direction=all` 使用独立 `history_seq`；direction 可选 all/in/out。
