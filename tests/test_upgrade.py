@@ -428,3 +428,32 @@ def test_sessions_include_group_info(tmp_path):
         store.observe(dict(message_id='c1',scene='c2c',chat_id='u',user_id='u',timestamp=iso()))
         c2c=next(x for x in c.get('/v1/sessions').json()['items'] if x['scene']=='c2c')
         assert 'group' not in c2c
+
+
+@pytest.mark.parametrize('raw,mentions,expected',[
+    ('<faceType=1,faceId="344",ext="eyJ0ZXh0Ijoi5aSn6IKl6bG8In0=">',None,'[表情:大肥鱼]'),
+    ('<faceType=1,faceId="344">',None,'[表情]'),
+    ('<@all>',None,'[@全体成员]'),
+    ('<@9A3022E375040EB36BE142F0B4402246>',
+     [{'user_id':'9A3022E375040EB36BE142F0B4402246','username':'蝉'}],'[@蝉]'),
+    ('<@9A3022E375040EB36BE142F0B4402246>',None,'[@成员]'),
+    ('欢迎欢迎',None,'欢迎欢迎'),
+    ('<@all> 开会 <faceType=1,faceId="9">',None,'[@全体成员] 开会 [表情]'),
+])
+def test_markup_normalisation(raw,mentions,expected):
+    from bridge.views import normalize_text
+    assert normalize_text(raw,mentions)==expected
+
+
+def test_lean_message_normalises_but_full_keeps_raw(tmp_path):
+    cfg=Settings(data=tmp_path,token=TOKEN,send_interval=0)
+    app=create_app(cfg,Fake())
+    with TestClient(app,headers=AUTH) as c:
+        store=app.state.store
+        store.observe(dict(message_id='m',scene='group',chat_id='g',user_id='u',timestamp=iso(),
+            content='<@9A3022E375040EB36BE142F0B4402246> 你看这个 <faceType=1,faceId="344",ext="eyJ0ZXh0Ijoi5aSn6IKl6bG8In0=">',
+            mentions=[{'user_id':'9A3022E375040EB36BE142F0B4402246','username':'蝉'}]))
+        lite=c.get('/v1/messages?detail=lite').json()['items'][0]
+        assert lite['text']=='[@蝉] 你看这个 [表情:大肥鱼]'
+        full=c.get('/v1/messages?detail=full').json()['items'][0]
+        assert full['content'].startswith('<@9A3022')

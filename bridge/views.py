@@ -6,6 +6,56 @@ archive shape for debugging. Both are produced from the same stored record, so
 there is a single source of truth.
 """
 
+import base64
+import json
+import re
+
+MENTION_ALL = re.compile(r'<@all>', re.I)
+MENTION_ID = re.compile(r'<@([0-9A-Za-z]+)>')
+FACE = re.compile(r'<faceType=(\d+)\s*,\s*faceId="?\d+"?\s*(?:,\s*ext="([^"]*)")?\s*/?>')
+
+
+def _face_label(ext):
+    """QQ puts the sticker's name inside a base64 JSON blob."""
+    if not ext:
+        return None
+    try:
+        payload = json.loads(base64.b64decode(ext, validate=True).decode('utf-8'))
+    except Exception:
+        return None
+    text = payload.get('text') if isinstance(payload, dict) else None
+    return text if isinstance(text, str) and text.strip() else None
+
+
+def normalize_text(content, mentions=None):
+    """Turn QQ markup into something an agent can read.
+
+    ``<@openid>`` becomes ``[@name]``, ``<@all>`` becomes ``[@全体成员]`` and
+    sticker tags become ``[表情:名字]`` (or ``[表情]`` when unnamed).
+    """
+    if not content:
+        return content
+    names = {}
+    for item in mentions or []:
+        uid = item.get('user_id') or item.get('id')
+        if uid:
+            names[str(uid)] = item.get('username') or item.get('name')
+
+    text = MENTION_ALL.sub('[@全体成员]', content)
+
+    def mention(match):
+        uid = match.group(1)
+        name = names.get(uid)
+        return f'[@%s]' % (name or '成员')
+
+    text = MENTION_ID.sub(mention, text)
+
+    def face(match):
+        label = _face_label(match.group(2))
+        return '[表情:%s]' % label if label else '[表情]'
+
+    return FACE.sub(face, text)
+
 
 def _kind(content_type, filename=''):
     value = (content_type or '').lower()
@@ -48,8 +98,9 @@ def lean_sender(record):
 
 def lean_message(record):
     out = {'seq': record.get('seq')}
-    if record.get('content'):
-        out['text'] = record['content']
+    text = normalize_text(record.get('content'), record.get('mentions'))
+    if text and text.strip():
+        out['text'] = text
     out['from'] = lean_sender(record)
     if record.get('timestamp'):
         out['at'] = record['timestamp']
