@@ -173,17 +173,33 @@ Agent 拿到就能判断：谁说的、说了什么、还来不来得及回。
 
 ## 配置
 
-| 变量 | 说明 |
-|---|---|
-| `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | 官方机器人凭据 |
-| `BRIDGE_API_TOKEN` | 桥的访问密钥，建议 32 字节随机 |
-| `BRIDGE_ALLOWED_HOSTS` | MCP 允许的 Host，精确匹配 |
-| `BRIDGE_ALLOWED_ORIGINS` | 浏览器 Origin 白名单 |
-| `BRIDGE_PROACTIVE_DENY` | 主动发送黑名单，留空即全开 |
-| `BRIDGE_MEDIA_URL_HOSTS` | 限定媒体域名，留空即公网 |
-| `BRIDGE_GROUP_FULL_MESSAGES` | 群全量消息，需平台权限 |
-| `BRIDGE_REPLY_WINDOW_C2C` 等 | 分场景回复窗口 |
-| `BRIDGE_MAX_REPLIES_C2C` 等 | 分场景回复次数 |
+**最少三个值就能跑起来：**
+
+```dotenv
+QQBOT_APP_ID=你的 AppID
+QQBOT_APP_SECRET=你的 AppSecret
+BRIDGE_API_TOKEN=自己生成的 32 字节随机串
+```
+
+用域名接 MCP 时再加一项，否则 `/mcp` 会返回 421：
+
+```dotenv
+BRIDGE_ALLOWED_HOSTS=你的域名
+```
+
+其余都有默认值，按需再开：
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | 是 | 官方机器人凭据 |
+| `BRIDGE_API_TOKEN` | 是 | 桥的访问密钥 |
+| `BRIDGE_ALLOWED_HOSTS` | 用域名时 | MCP 允许的 Host，精确匹配；默认只允许 localhost |
+| `BRIDGE_ALLOWED_ORIGINS` | 否 | 客户端发 `Origin` 头时需要匹配 |
+| `BRIDGE_PROACTIVE_DENY` | 否 | 主动发送黑名单，留空即全开 |
+| `BRIDGE_MEDIA_URL_HOSTS` | 否 | 限定媒体域名，留空即公网 |
+| `BRIDGE_GROUP_FULL_MESSAGES` | 否 | 群全量消息，需平台权限 |
+| `BRIDGE_REPLY_WINDOW_C2C` 等 | 否 | 分场景回复窗口，默认私聊 3600 秒、群 300 秒 |
+| `BRIDGE_MAX_REPLIES_C2C` 等 | 否 | 分场景回复次数，默认私聊 4 次、群 5 次 |
 
 完整清单见 [.env.example](.env.example)。
 
