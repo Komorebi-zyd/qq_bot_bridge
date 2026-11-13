@@ -416,11 +416,14 @@ class SendRequest(BaseModel):
 
 
 class StageFailure(Exception):
-    def __init__(self, stage='send', status_code=None, bizcode=None, uncertain=False):
-        super().__init__('platform operation failed')
+    def __init__(self, stage='send', status_code=None, bizcode=None, uncertain=False, reason=None):
+        # Platform codes are numeric; reason is a fixed local description, never
+        # arbitrary text echoed from an external response.
+        super().__init__(reason or 'platform operation failed')
         self.stage = stage if stage in ('validate','upload','send') else 'send'
         self.details = {k:v for k,v in dict(status_code=status_code,bizcode=bizcode).items() if type(v) is int}
         self.uncertain = uncertain
+        self.reason = reason
 
 
 class Rejected(StageFailure):
@@ -511,7 +514,8 @@ def create_app(cfg=None, backend=None):
                 except StageFailure as exc:
                     store.report_error(exc.stage, exc)
                     store.set_send_stage(row['key'],exc.stage,exc.details)
-                    status, error = ('unknown' if exc.uncertain else 'failed'), 'platform operation failed'
+                    status = 'unknown' if exc.uncertain else 'failed'
+                    error = exc.reason or 'platform operation failed'
                 except asyncio.CancelledError:
                     with store.db:
                         store.db.execute("UPDATE sends SET status='unknown',error='send interrupted',updated_at=? WHERE key=?",(iso(),row['key']))

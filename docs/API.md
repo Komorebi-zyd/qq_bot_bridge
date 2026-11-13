@@ -106,7 +106,9 @@ MCP `qq_upload_media(filename,content_base64)` 标准Base64，解码最多4MiB�
 | failed | 可确定未发送或平台明确拒绝 |
 | unknown | 发送结果有歧义，需要核实 |
 
-阶段包含 validate/upload/send/sent 等；error_details 保留可用的数字 HTTP状态/业务码。上传阶段失败可确定尚未调用发消息，post阶段超时等保留unknown。同一业务动作沿用原key查询；unknown 不自动重发。最终平台是否展示/阅读需用户确认。
+阶段包含 validate/upload/send/sent 等；error_details 保留数字 HTTP 状态与官方业务码，`error` 给出对应含义（例如 850026 表示 QQ 无法下载该 URL、850019 表示格式不支持、850031 表示超出大小）。上传阶段失败可确定尚未调用发消息，post 阶段超时等保留 unknown。同一业务动作沿用原 key 查询；unknown 不自动重发。
+
+媒体 URL 由 QQ 平台抓取。若平台报告下载失败（850026/850027 等），桥会按官方建议自行下载一次并改用分片上传重试；两者都失败时 `error` 会同时说明。
 
 ## 回复规则与兼容
 

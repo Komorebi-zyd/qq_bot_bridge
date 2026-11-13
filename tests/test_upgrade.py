@@ -119,9 +119,9 @@ def test_url_enqueue_then_sdk_recheck_native_upload(tmp_path,monkeypatch):
         calls.append(('validate',url)); return url
     monkeypatch.setattr(core,'validate_public_media_url',validate)
     monkeypatch.setattr(sdk,'validate_public_media_url',validate)
-    async def upload(self,scene,chat,source,kind,file_name=None):
+    async def upload(api,http,scene,chat,source,file_type,file_name=None):
         calls.append(('upload',source)); assert file_name=='x.png'; return 'token'
-    monkeypatch.setattr(MediaUploader,'upload',upload)
+    monkeypatch.setattr(sdk,'upload_by_url',upload)
     cfg=Settings(data=tmp_path,token=TOKEN,send_interval=0,authorized={'c2c:u'})
     store=Store(cfg); backend=sdk.OfficialBackend(store)
     backend.run=Fake().run; backend.connected=backend.api_ready=True
@@ -183,13 +183,12 @@ def test_real_sdk_native_url_upload_and_inbound_identity(tmp_path,monkeypatch):
     async def validate(url,hosts): return url
     monkeypatch.setattr(sdk,'validate_public_media_url',validate)
     calls=[]
+    async def upload(api,http,scene,chat,url,file_type,file_name=None):
+        assert scene=='group' and chat=='g' and url=='https://cdn.qq.com/a?sig=secret'
+        calls.append('upload')
+        return 'native-token'
+    monkeypatch.setattr(sdk,'upload_by_url',upload)
     class API:
-        async def upload_group_file(self,chat,msg):
-            body=msg.to_dict()
-            assert chat=='g' and body['url']=='https://cdn.qq.com/a?sig=secret'
-            assert body['srv_send_msg'] is False
-            calls.append('upload')
-            return {'file_info':'native-token'}
         async def post_group_message(self,chat,msg):
             assert msg.media.file_info=='native-token'
             calls.append('send')
@@ -220,14 +219,13 @@ def test_url_all_media_kinds_and_reserved_sequence(tmp_path,monkeypatch,kind,exp
     async def validate(url,hosts): return url
     monkeypatch.setattr(sdk,'validate_public_media_url',validate)
     seen=[]
+    async def upload(api,http,scene,chat,url,file_type,file_name=None):
+        assert chat=='u' and file_type==expected_type
+        assert url==f'https://cdn.qq.com/example.{extension}'
+        seen.append('upload')
+        return 'url-media-token'
+    monkeypatch.setattr(sdk,'upload_by_url',upload)
     class API:
-        async def upload_c2c_file(self,chat,msg):
-            data=msg.to_dict()
-            assert chat=='u' and data['file_type']==expected_type
-            assert data['url']==f'https://cdn.qq.com/example.{extension}'
-            assert data['srv_send_msg'] is False
-            seen.append('upload')
-            return {'file_info':'url-media-token'}
         async def post_c2c_message(self,chat,msg):
             assert msg.msg_seq==3 and msg.msg_type==7 and msg.msg_id=='original-id'
             assert msg.media.file_info=='url-media-token'
@@ -270,3 +268,101 @@ def test_legacy_history_interleaves_and_restarts(tmp_path):
         assert [x['direction'] for x in history]==['in','out','in']
         assert history[1]['timestamp']==iso(start+10)
         store.db.close()
+
+
+def _url_backend(tmp_path, monkeypatch, upload_impl):
+    import bridge.sdk as sdk
+    cfg=Settings(data=tmp_path,token=TOKEN,send_interval=0,authorized={'c2c:u'})
+    store=Store(cfg); backend=sdk.OfficialBackend(store)
+    backend.run=Fake().run; backend.connected=backend.api_ready=True
+    async def validate(url,hosts): return url
+    monkeypatch.setattr(sdk,'validate_public_media_url',validate)
+    monkeypatch.setattr(sdk,'upload_by_url',upload_impl)
+    class API:
+        async def post_c2c_message(self,chat,msg):
+            return {'id':'out'}
+    backend.api=API()
+    return store, backend
+
+
+def test_upload_bizcode_reason_is_reported(tmp_path, monkeypatch):
+    """A format rejection must surface the platform code and its meaning."""
+    from bridge.uploader import UploadError
+    async def upload(*a, **k):
+        raise UploadError(400, 850019)
+    store, backend = _url_backend(tmp_path, monkeypatch, upload)
+    app=create_app(store.cfg,backend)
+    with TestClient(app,headers=AUTH) as c:
+        c.post('/v1/messages/send',json=dict(idempotency_key='fmt',scene='c2c',chat_id='u',
+            media_url='https://cdn.qq.com/a.bin',media_kind='file'))
+        result=terminal(c,'fmt')
+        assert result['status']=='failed' and result['stage']=='upload'
+        assert result['error_details']=={'status_code':400,'bizcode':850019}
+        assert 'unsupported media format' in result['error']
+        # Not a download problem, so no local retry is attempted.
+        assert result['error'].count('bridge could not fetch') == 0
+    store.db.close()
+
+
+def test_upload_falls_back_to_local_copy(tmp_path, monkeypatch):
+    """850026 means the platform could not fetch the URL; retry with our own copy."""
+    import bridge.sdk as sdk
+    from bridge.uploader import UploadError
+    seen=[]
+    async def upload(*a, **k):
+        seen.append('url')
+        raise UploadError(400, 850026)
+    store, backend = _url_backend(tmp_path, monkeypatch, upload)
+    async def download(http,url,limit):
+        seen.append('download'); return b'media-bytes'
+    async def local(api,http,scene,chat,data,file_type,file_name):
+        seen.append('local'); assert data==b'media-bytes'; return 'local-token'
+    monkeypatch.setattr(sdk,'download_media',download)
+    monkeypatch.setattr(sdk,'upload_local_copy',local)
+    app=create_app(store.cfg,backend)
+    with TestClient(app,headers=AUTH) as c:
+        c.post('/v1/messages/send',json=dict(idempotency_key='fallback',scene='c2c',chat_id='u',
+            media_url='https://cdn.qq.com/a.png',media_kind='image'))
+        assert terminal(c,'fallback')['status']=='sent'
+        assert seen==['url','download','local']
+    store.db.close()
+
+
+def test_upload_reports_both_failures(tmp_path, monkeypatch):
+    import bridge.sdk as sdk
+    from bridge.uploader import UploadError
+    async def upload(*a, **k):
+        raise UploadError(400, 850026)
+    store, backend = _url_backend(tmp_path, monkeypatch, upload)
+    async def download(*a, **k):
+        raise ValueError('unreachable')
+    monkeypatch.setattr(sdk,'download_media',download)
+    app=create_app(store.cfg,backend)
+    with TestClient(app,headers=AUTH) as c:
+        c.post('/v1/messages/send',json=dict(idempotency_key='both',scene='c2c',chat_id='u',
+            media_url='https://cdn.qq.com/a.png',media_kind='image'))
+        result=terminal(c,'both')
+        assert result['status']=='failed' and result['stage']=='upload'
+        assert 'could not download' in result['error'] and 'bridge could not fetch' in result['error']
+        assert result['error_details']['bizcode']==850026
+    store.db.close()
+
+
+def test_uploader_parses_platform_code(monkeypatch):
+    import asyncio as aio
+    from bridge import uploader
+    class Resp:
+        status_code=400
+        def json(self): return {'code':850026,'message':'download failed'}
+    class Http:
+        async def post(self,*a,**k): return Resp()
+    class Api:
+        async def ensure_token(self): return 'token'
+    async def scenario():
+        try:
+            await uploader.upload_by_url(Api(),Http(),'c2c','u','https://cdn.qq.com/a.png',1,'a.png')
+        except uploader.UploadError as exc:
+            return exc
+        raise AssertionError('expected UploadError')
+    exc=aio.run(scenario())
+    assert exc.status_code==400 and exc.bizcode==850026 and exc.can_retry_locally

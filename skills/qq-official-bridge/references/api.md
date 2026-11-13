@@ -89,6 +89,8 @@ python scripts/qq_bridge.py upload --file "E:/Pictures/example.png"
 
 同一 key 且内容相同会返回原任务；同一 key 内容不同返回 409。网络超时后查询原 key，而不是创建新 key，可避免重复投递。
 
+`error_details` 含官方业务码（850026 下载失败、850019 格式不支持、850031 超出大小等），`error` 给出对应含义。平台抓不到媒体链接时，桥会自动下载后改走分片上传重试。
+
 回复窗口默认值为 C2C 3600 秒/4 次、群 300 秒/5 次、频道和 DM 300 秒/5 次。用户配置的较低上限可以生效；`capabilities` 的部署返回和 QQ 平台结果为最终依据。
 
 ## CLI 快速参考

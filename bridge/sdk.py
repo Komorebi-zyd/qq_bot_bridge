@@ -15,6 +15,7 @@ from qqbot_agent_sdk.api_client import Route
 from qqbot_agent_sdk.dto import MessageToCreate, GuildMessageToCreate, MediaInfo, MarkdownContent
 from qqbot_agent_sdk.media_loader import MediaUploader
 from .core import Rejected, StageFailure
+from .uploader import UploadError, download_media, upload_by_url, upload_local_copy
 from .media_url import validate_public_media_url
 
 
@@ -277,13 +278,9 @@ class OfficialBackend:
             except Exception:
                 raise StageFailure('validate') from None
             stage('upload')
-            uploader = MediaUploader(self.api,self.http,log_tag='QQBridge')
             kinds = {'image':MEDIA_TYPE_IMAGE,'video':MEDIA_TYPE_VIDEO,'voice':MEDIA_TYPE_VOICE,'file':MEDIA_TYPE_FILE}
-            try:
-                # SDK native URL path supplies srv_send_msg=false; never locally GET a URL.
-                token = await asyncio.wait_for(uploader.upload(scene,chat_id,source,kinds[body['media_kind']],file_name=filename),30)
-            except Exception as exc:
-                raise StageFailure('upload',**safe_error_codes(exc)) from None
+            file_type = kinds[body['media_kind']]
+            token = await self._upload_media(scene,chat_id,source,file_type,filename,is_url=bool(body.get('media_url')))
             stage('validate')
             from .core import validate_route
             try:
@@ -311,6 +308,34 @@ class OfficialBackend:
             status = codes.get('status_code')
             definite = status is not None and 400 <= status < 500 and status != 408
             raise StageFailure('send',**codes,uncertain=not definite) from None
+
+    async def _upload_media(self, scene, chat_id, source, file_type, filename, is_url):
+        """Upload via the platform URL path, falling back to a local copy.
+
+        The platform reports "cannot download this URL" (850026) separately from
+        a bad format, so a failed fetch is retried once with the bytes fetched by
+        the bridge and uploaded through the chunked path.
+        """
+        if not is_url:
+            uploader = MediaUploader(self.api,self.http,log_tag='QQBridge')
+            try:
+                return await asyncio.wait_for(uploader.upload(scene,chat_id,source,file_type,file_name=filename),30)
+            except Exception as exc:
+                raise StageFailure('upload',**safe_error_codes(exc)) from None
+        try:
+            return await upload_by_url(self.api,self.http,scene,chat_id,source,file_type,filename)
+        except UploadError as exc:
+            if not exc.can_retry_locally:
+                raise StageFailure('upload',status_code=exc.status_code,bizcode=exc.bizcode,reason=exc.reason) from None
+            first = exc
+        try:
+            data = await download_media(self.http,source,self.store.cfg.max_file)
+            return await asyncio.wait_for(
+                upload_local_copy(self.api,self.http,scene,chat_id,data,file_type,filename or 'media'),120)
+        except Exception:
+            reason = first.reason or 'QQ could not download the media URL'
+            raise StageFailure('upload',status_code=first.status_code,bizcode=first.bizcode,
+                               reason=reason+' and the bridge could not fetch it either') from None
 
     async def close(self):
         if self.ws:
