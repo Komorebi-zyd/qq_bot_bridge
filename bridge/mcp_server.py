@@ -19,6 +19,7 @@ from .core import create_app
 MAX_INLINE_MEDIA = 4 * 1024 * 1024
 Scene = Literal['c2c', 'group', 'guild', 'dm']
 MediaKind = Literal['image', 'voice', 'video', 'file']
+Detail = Literal['lite', 'full']
 
 
 class BearerAuth:
@@ -72,9 +73,10 @@ def attach_mcp(app):
         return await request('GET', '/v1/status')
 
     @mcp.tool()
-    async def qq_get_messages(after: int = 0, limit: int = 50, scene: Scene | None = None, chat_id: str | None = None) -> dict[str, Any]:
-        """按游标读取新消息，包含发言人资料、附件链接和回复状态。after 为上次 next_cursor，limit 为每页条数（1–200）。"""
-        params = {'after': after, 'limit': limit}
+    async def qq_get_messages(after: int = 0, limit: int = 20, scene: Scene | None = None,
+            chat_id: str | None = None, detail: Detail = 'lite') -> dict[str, Any]:
+        """按游标读取新消息，含发言人、正文、附件链接与回复状态。after 为上次 next_cursor。detail=lite 精简，full 返回原始字段。"""
+        params = {'after': after, 'limit': limit, 'detail': detail}
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id}.items() if v is not None})
         return await request('GET', '/v1/messages', params=params)
 
@@ -84,29 +86,33 @@ def attach_mcp(app):
         return await request('POST', f'/v1/messages/{seq}/ack')
 
     @mcp.tool()
-    async def qq_list_sessions() -> dict[str, Any]:
-        """列出会话及其显示名称、消息统计与主动联系状态。"""
-        return await request('GET', '/v1/sessions')
+    async def qq_list_sessions(detail: Detail = 'lite') -> dict[str, Any]:
+        """列出会话、群名、成员与主动联系状态。"""
+        return await request('GET', '/v1/sessions', params={'detail': detail})
 
     @mcp.tool()
-    async def qq_get_session_messages(scene: Scene, chat_id: str, after: int = 0, limit: int = 50) -> dict[str, Any]:
-        """分页读取指定会话收到的消息，包含发言人资料、正文和附件链接。"""
-        return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/messages', params={'after': after, 'limit': limit})
+    async def qq_get_session_messages(scene: Scene, chat_id: str, after: int = 0, limit: int = 20,
+            detail: Detail = 'lite') -> dict[str, Any]:
+        """分页读取指定会话收到的消息，含发言人、正文和附件链接。"""
+        return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/messages',
+                             params={'after': after, 'limit': limit, 'detail': detail})
 
     @mcp.tool()
     async def qq_send_message(idempotency_key: str, text: str = '', reply_to: int | None = None,
             scene: Scene | None = None, chat_id: str | None = None, media_id: str | None = None,
             media_kind: MediaKind | None = None, markdown: bool = False,
-            media_url: str | None = None, filename: str | None = None) -> dict[str, Any]:
+            media_url: str | None = None, filename: str | None = None,
+            detail: Detail = 'lite') -> dict[str, Any]:
         """发送文字、图片、视频、语音或文件。回复使用 reply_to；主动联系使用 scene 和 chat_id；媒体可传 media_url 直链或已上传的 media_id。idempotency_key 标识一次发送动作。"""
         return await request('POST', '/v1/messages/send', json=dict(idempotency_key=idempotency_key,
             text=text, reply_to=reply_to, scene=scene, chat_id=chat_id, media_id=media_id,
-            media_kind=media_kind, markdown=markdown, media_url=media_url, filename=filename))
+            media_kind=media_kind, markdown=markdown, media_url=media_url, filename=filename),
+            params={'detail': detail})
 
     @mcp.tool()
-    async def qq_get_send_result(key: str) -> dict[str, Any]:
-        """按发送动作的 key 查询处理阶段、最终状态和平台返回结果。"""
-        return await request('GET', '/v1/sends/' + quote(key, safe=''))
+    async def qq_get_send_result(key: str, detail: Detail = 'lite') -> dict[str, Any]:
+        """按发送动作的 key 查询阶段与最终状态；detail=full 附带平台原始返回。"""
+        return await request('GET', '/v1/sends/' + quote(key, safe=''), params={'detail': detail})
 
     @mcp.tool()
     async def qq_upload_media(filename: str, content_base64: str) -> dict[str, Any]:
@@ -122,13 +128,13 @@ def attach_mcp(app):
         return await request('POST', '/v1/media', files={'file': (filename, data, 'application/octet-stream')})
 
     @mcp.tool()
-    async def qq_get_capabilities() -> dict[str, Any]:
-        """查看文字和富媒体能力、上传限额、各场景回复时限与主动联系配置。"""
-        return await request('GET', '/v1/capabilities')
+    async def qq_get_capabilities(detail: Detail = 'lite') -> dict[str, Any]:
+        """查看可用场景、回复时限、媒体类型与上传限额。"""
+        return await request('GET', '/v1/capabilities', params={'detail': detail})
 
     @mcp.tool()
     async def qq_get_profiles(scene: Scene | None = None, chat_id: str | None = None,
-            user_id: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+            user_id: str | None = None, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         """分页查看会话成员资料，包含昵称、角色及资料来源，可按场景、会话或发言人筛选。"""
         params = {'limit': limit, 'offset': offset}
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id, 'user_id': user_id}.items() if v is not None})
@@ -140,11 +146,11 @@ def attach_mcp(app):
         return await request('GET', f'/v1/profiles/{scene}/{quote(chat_id, safe="")}/{quote(user_id, safe="")}')
 
     @mcp.tool()
-    async def qq_get_session_history(scene: Scene, chat_id: str, after: int = 0, limit: int = 50,
-            direction: Literal['all', 'in', 'out'] = 'all') -> dict[str, Any]:
-        """分页浏览会话的双向交流记录，含收到的消息和机器人已发送的内容。after 使用返回的历史 next_cursor。"""
+    async def qq_get_session_history(scene: Scene, chat_id: str, after: int = 0, limit: int = 20,
+            direction: Literal['all', 'in', 'out'] = 'all', detail: Detail = 'lite') -> dict[str, Any]:
+        """分页浏览会话的双向记录，含收到与已发出的内容。after 使用历史 next_cursor。"""
         return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/history',
-                             params={'after': after, 'limit': limit, 'direction': direction})
+                             params={'after': after, 'limit': limit, 'direction': direction, 'detail': detail})
 
     transport = mcp.streamable_http_app()
     # Merge exact ASGI routes, not Mount('/mcp'): no /mcp -> /mcp/ redirect.

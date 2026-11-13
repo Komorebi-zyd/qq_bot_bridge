@@ -50,7 +50,7 @@ URL：https://你的域名/mcp
 | qq_get_send_result | 查询发送阶段与结果 |
 | qq_upload_media | 上传小文件，取得 media_id |
 
-MCP description 采用简洁的正向能力说明。完整接口见 [docs/API.md](docs/API.md)。
+MCP description 采用简洁的正向能力说明。工具默认返回 `detail=lite` 精简结构（纯文字消息约 378 字符，比原始字段少 76%），需要排查时传 `detail=full` 取原始归档。完整接口见 [docs/API.md](docs/API.md)。
 
 ### URL 媒体回复
 

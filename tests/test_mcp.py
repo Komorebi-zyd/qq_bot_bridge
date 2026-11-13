@@ -100,7 +100,8 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
         sock.bind(('127.0.0.1', 0))
         host = f'127.0.0.1:{sock.getsockname()[1]}'
         app, fake = make_app(tmp_path, monkeypatch, host)
-        attachment = {'url': 'https://cdn.example/real.png', 'voice_wav_url': 'https://cdn.example/voice.wav'}
+        attachment = {'url': 'https://cdn.example/real.png', 'content_type': 'image/jpeg',
+                      'filename': 'real.jpg', 'size': 1234, 'voice_wav_url': 'https://cdn.example/voice.wav'}
         seq = app.state.store.observe(dict(message_id='incoming', scene='c2c', chat_id='user',
             user_id='user', content='hello', sender={'username':'Tester'}, attachments=[attachment], timestamp=iso()))
         server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False))
@@ -133,11 +134,23 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                             return result.structuredContent
 
                         assert await call('qq_status') == (await http.get(f'http://{host}/v1/status')).json()
+
+                        # MCP defaults to the lite projection; full stays available.
                         messages = await call('qq_get_messages', {'after': 0, 'limit': 1, 'scene': 'c2c', 'chat_id': 'user'})
-                        assert stable(messages) == stable((await http.get(f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user')).json())
-                        assert messages['items'][0]['attachments'] == [attachment]
-                        assert stable(await call('qq_get_session_messages', {'scene': 'c2c', 'chat_id': 'user'})) == stable(messages)
-                        assert (await call('qq_list_sessions'))['items'][0]['chat_id'] == 'user'
+                        assert messages == (await http.get(
+                            f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user&detail=lite')).json()
+                        assert messages['chat'] == {'scene': 'c2c', 'id': 'user'}
+                        first = messages['items'][0]
+                        assert first['text'] == 'hello' and first['from']['name'] == 'Tester'
+                        assert first['attachments'][0]['kind'] == 'image'
+                        assert first['attachments'][0]['url'] == attachment['url']
+                        assert 'message_id' not in first and 'sender_profile' not in first
+                        assert 'reply_remaining_seconds' not in first
+                        assert 'sender_profile' in (await http.get(
+                            f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user&detail=full')).json()['items'][0]
+
+                        assert await call('qq_get_session_messages', {'scene': 'c2c', 'chat_id': 'user'}) == messages
+                        assert (await call('qq_list_sessions'))['items'][0]['id'] == 'user'
                         assert (await call('qq_ack_message', {'seq': seq}))['acked']
                         uploaded = await call('qq_upload_media', {'filename': 'tiny.png', 'content_base64': base64.b64encode(b'fake-image').decode()})
                         assert uploaded['size'] == 10
@@ -149,15 +162,22 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                             if record['status'] == 'sent':
                                 break
                             await asyncio.sleep(.02)
-                        assert record['status'] == 'sent'
-                        assert (await http.get(f'http://{host}/v1/sends/mcp-turn')).json() == record
+                        assert record['status'] == 'sent' and record['key'] == 'mcp-turn'
+                        assert set(record) <= {'key','status','stage','msg_seq','error','codes'}
+                        assert (await http.get(f'http://{host}/v1/sends/mcp-turn?detail=lite')).json() == record
+                        assert 'result' in (await http.get(f'http://{host}/v1/sends/mcp-turn?detail=full')).json()
                         assert (await call('qq_send_message', send)) == record
                         assert len(fake.calls) == 1
-                        assert await call('qq_get_capabilities') == (await http.get(f'http://{host}/v1/capabilities')).json()
-                        assert await call('qq_get_profiles', {'scene': 'c2c', 'chat_id': 'user'}) == (await http.get(f'http://{host}/v1/profiles?scene=c2c&chat_id=user&limit=50&offset=0')).json()
+
+                        caps = await call('qq_get_capabilities')
+                        assert caps == (await http.get(f'http://{host}/v1/capabilities?detail=lite')).json()
+                        assert set(caps['scenes']) <= {'c2c','group'}
+                        assert caps['limits']['file_mb'] == 20.0
+                        assert await call('qq_get_profiles', {'scene': 'c2c', 'chat_id': 'user'}) == (await http.get(f'http://{host}/v1/profiles?scene=c2c&chat_id=user&limit=20&offset=0')).json()
                         history = await call('qq_get_session_history', {'scene': 'c2c', 'chat_id': 'user'})
-                        assert stable(history) == stable((await http.get(f'http://{host}/v1/sessions/c2c/user/history?after=0&limit=50&direction=all')).json())
-                        assert len(history['items']) >= 2
+                        assert history == (await http.get(
+                            f'http://{host}/v1/sessions/c2c/user/history?after=0&limit=20&direction=all&detail=lite')).json()
+                        assert [x['direction'] for x in history['items']] == ['in','out']
                         profile = await call('qq_get_profile', {'scene': 'c2c', 'chat_id': 'user', 'user_id': 'user'})
                         assert profile['username'] == 'Tester'
                         import bridge.core as core
@@ -174,7 +194,6 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                             await asyncio.sleep(.02)
                         assert url_result['status'] == 'sent'
                         assert len(fake.calls) == 2 and fake.calls[-1][0]['media_url'] == 'https://cdn.qq.com/test.mp4'
-
 
                         invalid = [
                             ('qq_get_messages', {'limit': 201}),

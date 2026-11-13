@@ -17,6 +17,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .media_url import validate_media_url, validate_public_media_url
+from . import views
 
 
 def iso(t=None):
@@ -34,6 +35,7 @@ def epoch(value):
 
 
 SCENES = ('c2c','group','guild','dm')
+Detail = Literal['lite','full']
 HARD_REPLIES = dict(c2c=4, group=5, guild=5, dm=5)
 DEFAULT_WINDOWS = dict(c2c=3600, group=300, guild=300, dm=300)
 
@@ -463,6 +465,10 @@ def validate_route(store, body):
     return scene, chat_id, reply_id
 
 
+def _send_view(record, detail):
+    return views.lean_send(record) if detail=='lite' else record
+
+
 def create_app(cfg=None, backend=None):
     cfg = cfg or Settings()
     if not cfg.token or len(cfg.token)<16:
@@ -587,8 +593,10 @@ def create_app(cfg=None, backend=None):
                 'proactive':True,'proactive_denied':sorted(cfg.proactive_deny)}
 
     @api.get('/messages')
-    async def messages(after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),scene: str|None=None,chat_id: str|None=None):
-        return store.messages(after,limit,scene,chat_id)
+    async def messages(after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),scene: str|None=None,
+                       chat_id: str|None=None,detail: Detail='full'):
+        page = store.messages(after,limit,scene,chat_id)
+        return views.lean_page(page,scene,chat_id) if detail=='lite' else page
 
     @api.post('/messages/{seq}/ack')
     async def ack(seq: int):
@@ -598,7 +606,7 @@ def create_app(cfg=None, backend=None):
         return {'seq':seq,'acked':True}
 
     @api.get('/sessions')
-    async def sessions():
+    async def sessions(detail: Detail='full'):
         rows = store.db.execute('SELECT scene,chat_id,MAX(seq) last_seq,COUNT(*) message_count FROM messages GROUP BY scene,chat_id ORDER BY last_seq DESC').fetchall()
         items = {(r['scene'],r['chat_id']):dict(r) for r in rows}
         for route in store.db.execute('SELECT DISTINCT scene,chat_id FROM send_routes WHERE scene IS NOT NULL AND chat_id IS NOT NULL'):
@@ -613,15 +621,20 @@ def create_app(cfg=None, backend=None):
             if scene == 'group':
                 # Populated from the official group-info endpoint when permitted.
                 item['group'] = store.group_info(chat)
-        return {'items':list(items.values())}
+        values = list(items.values())
+        if detail=='lite':
+            return {'items':[views.lean_session(item) for item in values]}
+        return {'items':values}
 
     @api.get('/sessions/{scene}/{chat_id}/messages')
-    async def history(scene: str,chat_id: str,after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200)):
-        return store.messages(after,limit,scene,chat_id)
+    async def history(scene: str,chat_id: str,after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),
+                      detail: Detail='full'):
+        page = store.messages(after,limit,scene,chat_id)
+        return views.lean_page(page,scene,chat_id) if detail=='lite' else page
 
     @api.get('/capabilities')
-    async def capabilities():
-        return {'features':{'media_url':True,'profiles':True,'session_history':True,'manual_profile_alias':False,
+    async def capabilities(detail: Detail='full'):
+        caps = {'features':{'media_url':True,'profiles':True,'session_history':True,'manual_profile_alias':False,
                             'platform_asr':True,'proactive':True},
                 'scenes':{scene:{'reply_window_seconds':cfg.windows[scene],'max_replies':cfg.reply_limits[scene],
                                   'platform_max_replies':HARD_REPLIES[scene] if scene in ('c2c','group') else None,
@@ -631,6 +644,7 @@ def create_app(cfg=None, backend=None):
                 'proactive':True,'proactive_denied':sorted(cfg.proactive_deny),
                 'media_url':{'https_only':True,'allowed_hosts':sorted(cfg.media_url_hosts),'platform_fetch':True},
                 'cursor_semantics':{'messages':'inbound_seq','session_history':'history_seq'}}
+        return views.lean_capabilities(caps) if detail=='lite' else caps
 
     @api.get('/profiles')
     async def profiles(scene: str|None=None,chat_id: str|None=None,user_id: str|None=None,
@@ -650,8 +664,10 @@ def create_app(cfg=None, backend=None):
         return store.profile(scene,chat_id,user_id)
 
     @api.get('/sessions/{scene}/{chat_id}/history')
-    async def session_history(scene: str,chat_id: str,after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),direction: Literal['all','in','out']='all'):
-        return store.session_history(scene,chat_id,after,limit,direction)
+    async def session_history(scene: str,chat_id: str,after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),
+                              direction: Literal['all','in','out']='all',detail: Detail='full'):
+        page = store.session_history(scene,chat_id,after,limit,direction)
+        return views.lean_page(page,scene,chat_id) if detail=='lite' else page
 
     @api.post('/media',status_code=201)
     async def upload(file: UploadFile=File(...)):
@@ -690,7 +706,7 @@ def create_app(cfg=None, backend=None):
                 await file.close()
 
     @api.post('/messages/send')
-    async def enqueue(body: SendRequest):
+    async def enqueue(body: SendRequest, detail: Detail='full'):
         payload = body.model_dump()
         encoded = json.dumps(payload,sort_keys=True,separators=(',',':'))
         fp = hashlib.sha256(encoded.encode()).hexdigest()
@@ -700,7 +716,7 @@ def create_app(cfg=None, backend=None):
             compatible = all(old.get(k)==v for k,v in payload.items()) and all(payload.get(k)==v for k,v in old.items())
             if row[0]!=fp and not compatible:
                 raise HTTPException(409,'idempotency key already used for different request')
-            return JSONResponse(store.send_record(body.idempotency_key),202)
+            return JSONResponse(_send_view(store.send_record(body.idempotency_key),detail),202)
         route = validate_route(store,payload)
         if body.media_url:
             try:
@@ -712,7 +728,7 @@ def create_app(cfg=None, backend=None):
             old = json.loads(existing['payload'])
             if existing['fingerprint'] != fp and not (all(old.get(k)==v for k,v in payload.items()) and all(payload.get(k)==v for k,v in old.items())):
                 raise HTTPException(409,'idempotency key already used for different request')
-            return JSONResponse(store.send_record(body.idempotency_key),202)
+            return JSONResponse(_send_view(store.send_record(body.idempotency_key),detail),202)
         if body.reply_to:
             # Include unknown/failed reservations conservatively; explicit manual review is required.
             count = store.reply_count(body.reply_to)
@@ -727,8 +743,9 @@ def create_app(cfg=None, backend=None):
         return JSONResponse(store.send_record(body.idempotency_key),202)
 
     @api.get('/sends/{key}')
-    async def send_status(key: str):
-        return store.send_record(key)
+    async def send_status(key: str,detail: Detail='full'):
+        record = store.send_record(key)
+        return views.lean_send(record) if detail=='lite' else record
 
     app.include_router(api)
     return app

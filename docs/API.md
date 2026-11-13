@@ -23,6 +23,29 @@
 
 MCP description 聚焦功能与参数。以下约定解释状态、权限与游标。工具响应提供 structuredContent 和文本兼容内容。
 
+### detail=lite 与 detail=full
+
+MCP 工具默认 `detail=lite`，返回 Agent 实际需要的内容；REST 默认 `full`，保持原始归档结构。两者可随时切换。
+
+lite 消息结构：
+
+```json
+{"seq": 9, "text": "hi",
+ "from": {"id": "...", "name": "Komorebi", "role": "owner", "avatar": "https://..."},
+ "at": "2026-11-13T17:54:38+08:00",
+ "attachments": [{"kind": "image", "filename": "a.jpg", "url": "https://...", "size": 184616}],
+ "can_reply": true, "replies_left": 5, "reply_deadline": "2026-11-13T09:59:38+00:00"}
+```
+
+- `sender` 与 `sender_profile` 合并为 `from`，头像只出现一次。
+- 不再返回 `message_id`（回复用 `seq`）、`received_at`、`event_type`、`name_source`、`username_source` 等内部字段。
+- 空值字段不输出；`acked` 仅在已确认时出现。
+- 同一会话的 `scene`/`chat_id` 提升为响应级 `chat`，不再逐条重复。
+- 用 `reply_deadline` 判断时效，不再返回每次调用都变化的秒级倒计时，响应可稳定比较。
+- `qq_get_send_result` 精简为 `key/status/stage/msg_seq/error/codes`；`qq_get_capabilities` 只列可用场景。
+
+体积对比（同一台机器人实测）：纯文字消息 1516 → 378 字符（-76%），带图消息 1879 → 747（-61%）。
+
 ## 消息与身份
 
 `GET /v1/messages?after=0&limit=50&scene=c2c&chat_id=...` 返回 `{items,next_cursor}`，scene/chat_id 可选，limit 1..200，after 排他。消息含：

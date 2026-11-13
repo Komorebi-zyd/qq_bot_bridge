@@ -14,7 +14,7 @@ Authorization: Bearer <QQ_BRIDGE_TOKEN>
 
 ### 新收到的消息
 
-`GET /v1/messages?after=0&limit=50`，可选 `scene`、`chat_id`。这是以桥内入站 `seq` 递增的游标接口，适合 heartbeat：处理完成后保存返回的 `next_cursor`。
+`GET /v1/messages?after=0&limit=50&detail=lite`，可选 `scene`、`chat_id`。`detail=lite` 返回精简结构（`from`/`text`/`at`/`attachments`/`can_reply`/`replies_left`/`reply_deadline`），`full` 返回原始归档字段。这是以桥内入站 `seq` 递增的游标接口，适合 heartbeat：处理完成后保存返回的 `next_cursor`。
 
 `POST /v1/messages/{seq}/ack`，JSON `{}`，确认已处理且可重复调用；不会删除历史或发送消息。
 
