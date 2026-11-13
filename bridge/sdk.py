@@ -14,7 +14,21 @@ from qqbot_agent_sdk import MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE
 from qqbot_agent_sdk.api_client import Route
 from qqbot_agent_sdk.dto import MessageToCreate, GuildMessageToCreate, MediaInfo, MarkdownContent
 from qqbot_agent_sdk.media_loader import MediaUploader
-from .core import Rejected
+from .core import Rejected, StageFailure
+from .media_url import validate_public_media_url
+
+
+def safe_error_codes(exc):
+    # Only numeric metadata is extracted; never keep SDK strings or signed URLs.
+    text = str(exc)
+    result = {}
+    match = re.search(r'QQ Bot API error \[(\d{3})\]',text)
+    if match:
+        result['status_code'] = int(match.group(1))
+    match = re.search(r'(?:biz_code|bizcode|code)[\s:=\"\']+(\d{1,12})(?!\d)',text)
+    if match:
+        result['bizcode'] = int(match.group(1))
+    return result
 
 
 def guard_sdk():
@@ -114,6 +128,12 @@ class OfficialBackend:
         for att in event.attachments or []:
             item = {'filename':att.filename or '', 'content_type':att.content_type or '',
                     'url':att.resolved_url or '', 'size':att.size or 0}
+            for dimension in ('width','height'):
+                value = getattr(att,dimension,None)
+                if type(value) is int:
+                    item[dimension] = value
+            if getattr(att,'asr_refer_text',None):
+                item['asr_text'] = att.asr_refer_text
             if att.voice_wav_url:
                 item['voice_wav_url'] = att.voice_wav_url
             attachments.append(item)
@@ -121,7 +141,25 @@ class OfficialBackend:
         asr = raw.get('asr_refer_text')
         if asr is None:
             asr = next((a.get('asr_refer_text') for a in raw.get('attachments',[]) if a.get('asr_refer_text')), None)
-        self.store.observe({'message_id':event.message_id,'scene':event.chat_scope,
+        author = raw.get('author') or {}
+        sender = self.store.identity(author,event.user_id)
+        if not sender.get('username') and isinstance(getattr(event,'user_name',None),str):
+            sender['username'] = event.user_name
+            sender['username_source'] = 'sdk_event'
+        elif 'username' in sender:
+            sender['username_source'] = 'raw_event'
+        mentions = []
+        for mention in raw.get('mentions') or []:
+            if isinstance(mention,dict):
+                uid = next((mention[k] for k in ('user_openid','member_openid','id') if mention.get(k)), '')
+                mentions.append({**self.store.identity(mention,uid),'source':'raw_event'})
+        sdk_mentions = getattr(event,'mentions',None)
+        if not mentions and sdk_mentions:
+            for mention in json_safe(sdk_mentions):
+                if isinstance(mention,dict):
+                    uid = next((mention[k] for k in ('user_id','user_openid','member_openid','id') if mention.get(k)), '')
+                    mentions.append({**self.store.identity(mention,uid),'source':'sdk_event'})
+        self.store.observe({'sender':sender,'mentions':mentions,'message_id':event.message_id,'scene':event.chat_scope,
             'chat_id':event.chat_id,'user_id':event.user_id,'content':event.content,
             'timestamp':event.timestamp,'attachments':attachments,'asr_text':asr,
             'msg_elements':json_safe(event.msg_elements),'message_reference':raw.get('message_reference'),
@@ -222,28 +260,44 @@ class OfficialBackend:
         # Guild DTO in 1.2.2 has no Markdown field; reject rather than silently change format.
         if scene in ('guild','dm') and body['markdown']:
             raise Rejected('guild/dm markdown unavailable')
+        key = body.get('idempotency_key')
+        def stage(value):
+            if key:
+                self.store.set_send_stage(key,value)
+        msg_seq = body.get('_msg_seq') or (1 if reply_id else QQApiClient.next_msg_seq())
+        if body.get('media_id') or body.get('media_url'):
+            stage('validate')
+            try:
+                if body.get('media_url'):
+                    source = await validate_public_media_url(body['media_url'], self.store.cfg.media_url_hosts)
+                    filename = self.store.safe_filename(body.get('filename')) if body.get('filename') else None
+                else:
+                    source = str(self.store.media_path(body['media_id']).resolve())
+                    filename = self.store.safe_filename(body['filename']) if body.get('filename') else self.store.media_filename(body['media_id'],body['media_kind'])
+            except Exception:
+                raise StageFailure('validate') from None
+            stage('upload')
+            uploader = MediaUploader(self.api,self.http,log_tag='QQBridge')
+            kinds = {'image':MEDIA_TYPE_IMAGE,'video':MEDIA_TYPE_VIDEO,'voice':MEDIA_TYPE_VOICE,'file':MEDIA_TYPE_FILE}
+            try:
+                # SDK native URL path supplies srv_send_msg=false; never locally GET a URL.
+                token = await asyncio.wait_for(uploader.upload(scene,chat_id,source,kinds[body['media_kind']],file_name=filename),30)
+            except Exception as exc:
+                raise StageFailure('upload',**safe_error_codes(exc)) from None
+            stage('validate')
+            from .core import validate_route
+            try:
+                validate_route(self.store,body)
+            except HTTPException:
+                raise StageFailure('validate') from None
+            msg = MessageToCreate(content=body['text'],msg_type=7,msg_seq=msg_seq,msg_id=reply_id or '',media=MediaInfo(file_info=token))
+        else:
+            msg = MessageToCreate(content=body['text'],msg_type=0,msg_seq=msg_seq,msg_id=reply_id or '')
+            if body['markdown']:
+                msg.msg_type, msg.content = 2, ''
+                msg.markdown = MarkdownContent(content=body['text'])
+        stage('send')
         try:
-            if body.get('media_id'):
-                path = self.store.media_path(body['media_id'])
-                uploader = MediaUploader(self.api,self.http,log_tag='QQBridge')
-                kinds = {'image':MEDIA_TYPE_IMAGE,'video':MEDIA_TYPE_VIDEO,
-                         'voice':MEDIA_TYPE_VOICE,'file':MEDIA_TYPE_FILE}
-                token = await uploader.upload(scene,chat_id,str(path.resolve()),kinds[body['media_kind']],
-                    file_name=self.store.media_filename(body['media_id'],body['media_kind']))
-                # Upload does not send; expiry must be checked again before message creation.
-                from .core import validate_route
-                try:
-                    validate_route(self.store,body)
-                except HTTPException:
-                    raise Rejected("media uploaded but message expired before send") from None
-                msg = MessageToCreate(content=body['text'],msg_type=7,
-                    msg_seq=QQApiClient.next_msg_seq(),msg_id=reply_id or '',media=MediaInfo(file_info=token))
-            else:
-                msg = MessageToCreate(content=body['text'],msg_type=0,
-                    msg_seq=QQApiClient.next_msg_seq(),msg_id=reply_id or '')
-                if body['markdown']:
-                    msg.msg_type, msg.content = 2, ''
-                    msg.markdown = MarkdownContent(content=body['text'])
             if scene=='c2c':
                 return await self.api.post_c2c_message(chat_id,msg)
             if scene=='group':
@@ -252,13 +306,11 @@ class OfficialBackend:
             if scene=='guild':
                 return await self.api.post_guild_message(chat_id,guild_msg)
             return await self.api.request(Route('POST','/dms/{guild_id}/messages',guild_id=chat_id),guild_msg.to_dict())
-        except RuntimeError as exc:
-            # Only explicit 4xx (except request timeout) is definite. 5xx/transport/parse
-            # errors can occur after acceptance, therefore they remain unknown.
-            match = re.search(r'QQ Bot API error \[(4\d\d)\]',str(exc))
-            if match and match.group(1)!='408':
-                raise Rejected('platform rejected') from None
-            raise
+        except Exception as exc:
+            codes = safe_error_codes(exc)
+            status = codes.get('status_code')
+            definite = status is not None and 400 <= status < 500 and status != 408
+            raise StageFailure('send',**codes,uncertain=not definite) from None
 
     async def close(self):
         if self.ws:

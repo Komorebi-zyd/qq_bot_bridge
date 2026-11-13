@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Once-only HTTP CLI for the QQ cloud bridge. Python standard library only.
+"""Once-only HTTP CLI for the QQ official cloud bridge. Python standard library only.
 No daemon, model calls, automatic sends, or credentials stored on disk.
 """
 from __future__ import annotations
@@ -66,6 +66,7 @@ def request(method, path, payload=None, *, raw=None, content_type=None):
 
 
 def upload_file(path_str):
+    """Upload local file bytes as multipart; it never triggers a QQ send."""
     path = Path(path_str).expanduser()
     if not path.is_file():
         raise ValueError("Upload file does not exist or is not a regular file.")
@@ -81,7 +82,6 @@ def upload_file(path_str):
     if not blob:
         raise ValueError("Cannot upload an empty file.")
     boundary = "qqbridge-" + uuid.uuid4().hex
-    # Preserve extension, never interpolate unsafe filesystem names into MIME headers.
     extension = path.suffix.lower()
     if not extension[1:].isalnum() or len(extension) > 12:
         extension = ".bin"
@@ -95,39 +95,92 @@ def upload_file(path_str):
     return request("POST", "/v1/media", raw=data, content_type=f"multipart/form-data; boundary={boundary}")
 
 
+def add_page_arguments(parser):
+    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--offset", type=int, default=0)
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("status", help="HTTP/gateway readiness, no sends")
-    sub.add_parser("sessions", help="Only sessions observed by this bridge")
-    inbox = sub.add_parser("inbox", help="Pull by cursor; never auto-ack or send")
+    sub.add_parser("status", help="Show HTTP and QQ gateway readiness")
+    sub.add_parser("capabilities", help="Show enabled bridge features and limits")
+    sub.add_parser("sessions", help="List sessions observed by this bridge")
+    inbox = sub.add_parser("inbox", help="Pull inbound messages by cursor; never auto-ack or send")
     inbox.add_argument("--after", type=int, default=0)
     inbox.add_argument("--limit", type=int, default=50)
-    inbox.add_argument("--scene", choices=["c2c", "group"])
+    inbox.add_argument("--scene", choices=["c2c", "group", "guild", "dm"])
     inbox.add_argument("--chat-id")
-    ack = sub.add_parser("ack")
+    history = sub.add_parser("history", help="Read saved all-direction session history using history_seq")
+    history.add_argument("--scene", choices=["c2c", "group", "guild", "dm"], required=True)
+    history.add_argument("--chat-id", required=True)
+    history.add_argument("--after", type=int, default=0, help="history_seq cursor")
+    history.add_argument("--limit", type=int, default=50)
+    history.add_argument("--direction", choices=["all", "in", "out"], default="all")
+    profiles = sub.add_parser("profiles", help="List cached sender profiles for one observed conversation")
+    profiles.add_argument("--scene", choices=["c2c", "group", "guild", "dm"], required=True)
+    profiles.add_argument("--chat-id", required=True)
+    profiles.add_argument("--user-id")
+    add_page_arguments(profiles)
+    profile = sub.add_parser("profile", help="Show one cached sender profile")
+    profile.add_argument("--scene", choices=["c2c", "group", "guild", "dm"], required=True)
+    profile.add_argument("--chat-id", required=True)
+    profile.add_argument("--user-id", required=True)
+    ack = sub.add_parser("ack", help="Mark a bridge message processed")
     ack.add_argument("--seq", type=int, required=True)
-    upload = sub.add_parser("upload", help="Upload only; does NOT send to QQ")
+    upload = sub.add_parser("upload", help="Upload file bytes only; does NOT send to QQ")
     upload.add_argument("--file", required=True)
-    send = sub.add_parser("send", help="Real QQ send; user authorization required")
+    send = sub.add_parser("send", help="Send an authorized QQ reply or proactive message")
     send.add_argument("--key", required=True, help="Stable idempotency key; reuse on retry")
     send.add_argument("--reply-to", type=int)
-    send.add_argument("--scene", choices=["c2c", "group"])
+    send.add_argument("--scene", choices=["c2c", "group", "guild", "dm"])
     send.add_argument("--chat-id")
     send.add_argument("--text", default="")
-    send.add_argument("--media-id")
+    source = send.add_mutually_exclusive_group()
+    source.add_argument("--media-id")
+    source.add_argument("--media-url", help="Public HTTPS direct media link; QQ fetches it natively")
+    send.add_argument("--filename", help="Optional display filename for media-id or media-url")
     send.add_argument("--kind", choices=["image", "voice", "video", "file"])
     send.add_argument("--markdown", action="store_true")
-    result = sub.add_parser("result")
+    result = sub.add_parser("result", help="Look up a send by its idempotency key")
     result.add_argument("--key", required=True)
     return parser
+
+
+def page_query(args, *, include_user=False):
+    if args.offset < 0 or not 1 <= args.limit <= 100:
+        raise ValueError("offset >= 0 and limit 1..100 required.")
+    query = {"scene": args.scene, "chat_id": args.chat_id, "limit": args.limit, "offset": args.offset}
+    if include_user and args.user_id:
+        query["user_id"] = args.user_id
+    return urllib.parse.urlencode(query)
+
+
+def valid_media_url(value):
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("media-url must be a public HTTPS direct link without embedded credentials or fragment.")
 
 
 def dispatch(args):
     if args.action == "status":
         return request("GET", "/v1/status")
+    if args.action == "capabilities":
+        return request("GET", "/v1/capabilities")
     if args.action == "sessions":
         return request("GET", "/v1/sessions")
+    if args.action == "profiles":
+        return request("GET", "/v1/profiles?" + page_query(args, include_user=True))
+    if args.action == "profile":
+        path = "/v1/profiles/{}/{}/{}".format(*(urllib.parse.quote(v, safe="") for v in (args.scene, args.chat_id, args.user_id)))
+        return request("GET", path)
+    if args.action == "history":
+        if args.after < 0 or not 1 <= args.limit <= 100:
+            raise ValueError("after >= 0 and limit 1..100 required.")
+        query = urllib.parse.urlencode({"after": args.after, "limit": args.limit, "direction": args.direction})
+        path = "/v1/sessions/{}/{}/history?{}".format(
+            urllib.parse.quote(args.scene, safe=""), urllib.parse.quote(args.chat_id, safe=""), query)
+        return request("GET", path)
     if args.action == "inbox":
         if args.after < 0 or not 1 <= args.limit <= 100:
             raise ValueError("after >= 0 and limit 1..100 required.")
@@ -146,10 +199,15 @@ def dispatch(args):
     if args.action == "result":
         return request("GET", "/v1/sends/" + urllib.parse.quote(args.key, safe=""))
     if args.action == "send":
-        if not args.text.strip() and not args.media_id:
-            raise ValueError("Text or media_id required.")
-        if bool(args.media_id) != bool(args.kind):
-            raise ValueError("media-id and kind must be specified together.")
+        media_source = args.media_id or args.media_url
+        if not args.text.strip() and not media_source:
+            raise ValueError("Text, media-id, or media-url required.")
+        if bool(media_source) != bool(args.kind):
+            raise ValueError("media-id/media-url and kind must be specified together.")
+        if args.filename and not media_source:
+            raise ValueError("filename requires media-id or media-url.")
+        if args.media_url:
+            valid_media_url(args.media_url)
         if args.reply_to is None and not (args.scene and args.chat_id):
             raise ValueError("Proactive send needs scene and chat-id; reply needs reply-to.")
         if args.reply_to is not None and (args.scene or args.chat_id):
@@ -161,6 +219,10 @@ def dispatch(args):
             data.update(scene=args.scene, chat_id=args.chat_id)
         if args.media_id:
             data.update(media_id=args.media_id, media_kind=args.kind)
+        elif args.media_url:
+            data.update(media_url=args.media_url, media_kind=args.kind)
+        if args.filename:
+            data["filename"] = args.filename
         return request("POST", "/v1/messages/send", data)
     raise ValueError("Unsupported action")
 

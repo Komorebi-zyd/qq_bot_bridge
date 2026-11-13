@@ -31,7 +31,7 @@ class Fake:
 
 @pytest.fixture
 def setup(tmp_path):
-    cfg = Settings(data=tmp_path,token=TOKEN,send_interval=0,authorized={'c2c:allowed'})
+    cfg = Settings(data=tmp_path,token=TOKEN,send_interval=0,authorized={'c2c:allowed'},max_replies=1)
     fake = Fake()
     app = create_app(cfg,fake)
     with TestClient(app,headers=AUTH) as client:
@@ -106,7 +106,7 @@ def test_unknown_never_resent(setup):
 
 def test_expiry_authorization_and_validation(setup):
     _,fake,app,c=setup
-    seq=observe(app,timestamp=iso(time.time()-1000))
+    seq=observe(app,timestamp=iso(time.time()-4000))
     assert c.post('/v1/messages/send',json={'idempotency_key':'old','reply_to':seq,'text':'x'}).status_code==409
     seq2=observe(app,'bad',timestamp='not-a-time')
     assert c.post('/v1/messages/send',json={'idempotency_key':'bad','reply_to':seq2,'text':'x'}).status_code==409
@@ -285,7 +285,7 @@ def test_future_deadlines(tmp_path,monkeypatch):
     for offset in (-50,0,30,30.001,100000):
         seq=store.observe(dict(message_id=str(offset),scene='c2c',chat_id='u',timestamp=iso(1800000000+offset)))
         deadline=core.epoch(store.message(seq)['reply_deadline'])
-        assert deadline==(1800000000+240+min(offset,0) if offset<=30 else None)
+        assert deadline==(1800000000+3600+min(offset,0) if offset<=30 else None)
     store.db.close()
 
 

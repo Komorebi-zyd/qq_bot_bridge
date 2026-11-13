@@ -55,6 +55,41 @@ class ClientTests(unittest.TestCase):
             self.assertIn(b'name="file"', req.call_args.kwargs["raw"])
             self.assertIn(b'filename="upload.png"', req.call_args.kwargs["raw"])
 
+    def test_media_url_send_contract(self):
+        args = c.make_parser().parse_args([
+            "send", "--reply-to", "123", "--media-url", "https://media.example/picture.png",
+            "--kind", "image", "--filename", "picture.png", "--key", "url-123",
+        ])
+        with patch.object(c, "request", return_value={"status": "queued"}) as req:
+            c.dispatch(args)
+        body = req.call_args.args[2]
+        self.assertEqual(body["media_url"], "https://media.example/picture.png")
+        self.assertEqual(body["filename"], "picture.png")
+        self.assertNotIn("media_id", body)
+
+    def test_media_url_requires_https(self):
+        args = c.make_parser().parse_args([
+            "send", "--reply-to", "123", "--media-url", "http://media.example/a.png",
+            "--kind", "image", "--key", "url-123",
+        ])
+        with self.assertRaises(ValueError):
+            c.dispatch(args)
+
+    def test_capabilities_profiles_and_history_routes(self):
+        cases = [
+            (["capabilities"], "/v1/capabilities"),
+            (["profiles", "--scene", "c2c", "--chat-id", "chat", "--user-id", "user", "--limit", "7", "--offset", "2"],
+             "/v1/profiles?scene=c2c&chat_id=chat&limit=7&offset=2&user_id=user"),
+            (["profile", "--scene", "c2c", "--chat-id", "chat/id", "--user-id", "user id"],
+             "/v1/profiles/c2c/chat%2Fid/user%20id"),
+            (["history", "--scene", "group", "--chat-id", "chat/id", "--after", "9", "--limit", "7", "--direction", "out"],
+             "/v1/sessions/group/chat%2Fid/history?after=9&limit=7&direction=out"),
+        ]
+        for argv, expected in cases:
+            with self.subTest(argv=argv), patch.object(c, "request", return_value={}) as req:
+                c.dispatch(c.make_parser().parse_args(argv))
+                self.assertEqual(req.call_args.args, ("GET", expected))
+
     def test_redirect_never_forward_token(self):
         self.assertIsNone(c.NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.example"))
 

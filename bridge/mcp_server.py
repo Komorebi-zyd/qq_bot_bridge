@@ -36,7 +36,7 @@ class BearerAuth:
 
 
 def _exact_values(name, default):
-    values = [v.strip() for v in os.getenv(name, default).split(',') if v.strip()]
+    values = [v.strip() for v in (os.getenv(name, '').strip() or default).split(',') if v.strip()]
     if not values or any('*' in v or '?' in v or '#' in v for v in values):
         raise RuntimeError(name + ' must contain explicit values, not wildcards')
     return values
@@ -52,7 +52,7 @@ def attach_mcp(app):
     mcp = FastMCP('QQ 云桥', stateless_http=True, json_response=True,
         streamable_http_path='/mcp', transport_security=security,
         max_request_body_size=cfg.max_request,
-        instructions='读取官方网关已观察并归档的消息，不是任意 QQ 历史查询。Agent 须自行定时轮询；MCP 不会唤醒 Agent。发送须检查最终状态，不得换键盲重试。')
+        instructions='通过 QQ 云桥浏览会话、识别发言人、读取图片语音等附件，并发送文字或媒体直链。支持 Agent 心跳巡查、消息回复和主动联系。')
 
     async def request(method, path, **kwargs):
         # ASGITransport deliberately does not start another lifespan/queue/gateway.
@@ -68,48 +68,49 @@ def attach_mcp(app):
 
     @mcp.tool()
     async def qq_status() -> dict[str, Any]:
-        """读取 QQ 网关连接状态与共享发送队列统计；不是送达保证。"""
+        """查看 QQ 在线状态、发送队列统计和最近运行诊断。"""
         return await request('GET', '/v1/status')
 
     @mcp.tool()
     async def qq_get_messages(after: int = 0, limit: int = 50, scene: Scene | None = None, chat_id: str | None = None) -> dict[str, Any]:
-        """分页读取已观察消息；after 排他，limit 1..200。保留真实附件链接；处理后可靠保存 next_cursor。不是任意官方聊天历史。"""
+        """按游标读取新消息，包含发言人资料、附件链接和回复状态。after 为上次 next_cursor，limit 为每页条数（1–200）。"""
         params = {'after': after, 'limit': limit}
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id}.items() if v is not None})
         return await request('GET', '/v1/messages', params=params)
 
     @mcp.tool()
     async def qq_ack_message(seq: int) -> dict[str, Any]:
-        """幂等标记消费，不删除历史、不推进客户端游标。"""
+        """将 seq 对应的消息标记为已处理，返回确认状态。"""
         return await request('POST', f'/v1/messages/{seq}/ack')
 
     @mcp.tool()
     async def qq_list_sessions() -> dict[str, Any]:
-        """列出已观察到消息的会话；不是联系人或群成员目录。"""
+        """列出会话及其显示名称、消息统计与主动联系状态。"""
         return await request('GET', '/v1/sessions')
 
     @mcp.tool()
     async def qq_get_session_messages(scene: Scene, chat_id: str, after: int = 0, limit: int = 50) -> dict[str, Any]:
-        """读取一个会话的本地归档分页，limit 1..200；不能拉取未观察的官方历史。"""
+        """分页读取指定会话收到的消息，包含发言人资料、正文和附件链接。"""
         return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/messages', params={'after': after, 'limit': limit})
 
     @mcp.tool()
     async def qq_send_message(idempotency_key: str, text: str = '', reply_to: int | None = None,
             scene: Scene | None = None, chat_id: str | None = None, media_id: str | None = None,
-            media_kind: MediaKind | None = None, markdown: bool = False) -> dict[str, Any]:
-        """进入同一个持久发送队列。reply_to 为已观察 seq；主动发送须预授权。queued 不等于送达；同键同正文重提安全，unknown 禁止换键盲重试。"""
+            media_kind: MediaKind | None = None, markdown: bool = False,
+            media_url: str | None = None, filename: str | None = None) -> dict[str, Any]:
+        """发送文字、图片、视频、语音或文件。回复使用 reply_to；主动联系使用 scene 和 chat_id；媒体可传 media_url 直链或已上传的 media_id。idempotency_key 标识一次发送动作。"""
         return await request('POST', '/v1/messages/send', json=dict(idempotency_key=idempotency_key,
             text=text, reply_to=reply_to, scene=scene, chat_id=chat_id, media_id=media_id,
-            media_kind=media_kind, markdown=markdown))
+            media_kind=media_kind, markdown=markdown, media_url=media_url, filename=filename))
 
     @mcp.tool()
     async def qq_get_send_result(key: str) -> dict[str, Any]:
-        """查询 queued/sending/sent/failed/unknown；sent 仅平台接受，不保证阅读。"""
+        """按发送动作的 key 查询处理阶段、最终状态和平台返回结果。"""
         return await request('GET', '/v1/sends/' + quote(key, safe=''))
 
     @mcp.tool()
     async def qq_upload_media(filename: str, content_base64: str) -> dict[str, Any]:
-        """仅小文件标准 base64（解码最多 4MiB），不支持本地路径或 URL 获取。大文件用 REST POST /v1/media multipart。返回 media_id；文件名只作元数据。"""
+        """上传标准 Base64 编码的小文件（解码后最多 4MiB），返回可用于发送的 media_id。公网媒体直链可直接交给 qq_send_message。"""
         if len(content_base64) > 4 * ((MAX_INLINE_MEDIA + 2) // 3):
             raise ToolError('inline media exceeds 4MiB; use REST multipart upload')
         try:
@@ -119,6 +120,31 @@ def attach_mcp(app):
         if len(data) > MAX_INLINE_MEDIA:
             raise ToolError('inline media exceeds 4MiB; use REST multipart upload')
         return await request('POST', '/v1/media', files={'file': (filename, data, 'application/octet-stream')})
+
+    @mcp.tool()
+    async def qq_get_capabilities() -> dict[str, Any]:
+        """查看文字和富媒体能力、上传限额、各场景回复时限与主动联系配置。"""
+        return await request('GET', '/v1/capabilities')
+
+    @mcp.tool()
+    async def qq_get_profiles(scene: Scene | None = None, chat_id: str | None = None,
+            user_id: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """分页查看会话成员资料，包含昵称、角色及资料来源，可按场景、会话或发言人筛选。"""
+        params = {'limit': limit, 'offset': offset}
+        params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id, 'user_id': user_id}.items() if v is not None})
+        return await request('GET', '/v1/profiles', params=params)
+
+    @mcp.tool()
+    async def qq_get_profile(scene: Scene, chat_id: str, user_id: str) -> dict[str, Any]:
+        """获取指定会话中一位发言人的昵称、身份角色和最新缓存资料。"""
+        return await request('GET', f'/v1/profiles/{scene}/{quote(chat_id, safe="")}/{quote(user_id, safe="")}')
+
+    @mcp.tool()
+    async def qq_get_session_history(scene: Scene, chat_id: str, after: int = 0, limit: int = 50,
+            direction: Literal['all', 'in', 'out'] = 'all') -> dict[str, Any]:
+        """分页浏览会话的双向交流记录，含收到的消息和机器人已发送的内容。after 使用返回的历史 next_cursor。"""
+        return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/history',
+                             params={'after': after, 'limit': limit, 'direction': direction})
 
     transport = mcp.streamable_http_app()
     # Merge exact ASGI routes, not Mount('/mcp'): no /mcp -> /mcp/ redirect.

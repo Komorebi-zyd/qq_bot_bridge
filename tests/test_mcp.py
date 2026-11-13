@@ -13,10 +13,19 @@ from mcp.client.streamable_http import streamable_http_client
 from bridge.core import Settings, iso
 from bridge.mcp_server import MAX_INLINE_MEDIA, create_combined_app
 
+def stable(value):
+    if isinstance(value, dict):
+        return {k: stable(v) for k, v in value.items() if k != 'reply_remaining_seconds'}
+    if isinstance(value, list):
+        return [stable(v) for v in value]
+    return value
+
+
 TOKEN = 'offline-test-token-0123456789'
 AUTH = {'Authorization': 'Bearer ' + TOKEN}
 TOOLS = {'qq_status', 'qq_get_messages', 'qq_ack_message', 'qq_list_sessions',
-         'qq_get_session_messages', 'qq_send_message', 'qq_get_send_result', 'qq_upload_media'}
+         'qq_get_session_messages', 'qq_send_message', 'qq_get_send_result', 'qq_upload_media',
+         'qq_get_capabilities', 'qq_get_profiles', 'qq_get_profile', 'qq_get_session_history'}
 
 
 class Fake:
@@ -93,7 +102,7 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
         app, fake = make_app(tmp_path, monkeypatch, host)
         attachment = {'url': 'https://cdn.example/real.png', 'voice_wav_url': 'https://cdn.example/voice.wav'}
         seq = app.state.store.observe(dict(message_id='incoming', scene='c2c', chat_id='user',
-            user_id='user', content='hello', attachments=[attachment], timestamp=iso()))
+            user_id='user', content='hello', sender={'username':'Tester'}, attachments=[attachment], timestamp=iso()))
         server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False))
         task = asyncio.create_task(server.serve(sockets=[sock]))
         try:
@@ -111,6 +120,12 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         assert session_id() is None
                         tools = await session.list_tools()
                         assert {t.name for t in tools.tools} == TOOLS
+                        negative = ('禁止', '不支持', '不能', '不得', '不是', '不删除', '不推进', '不保证')
+                        for tool in tools.tools:
+                            assert tool.description and len(tool.description) < 220
+                            assert not any(word in tool.description for word in negative), tool.name
+                        send_tool = next(t for t in tools.tools if t.name == 'qq_send_message')
+                        assert {'media_url', 'filename'} <= set(send_tool.inputSchema['properties'])
 
                         async def call(name, args=None):
                             result = await session.call_tool(name, args or {})
@@ -119,9 +134,9 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
 
                         assert await call('qq_status') == (await http.get(f'http://{host}/v1/status')).json()
                         messages = await call('qq_get_messages', {'after': 0, 'limit': 1, 'scene': 'c2c', 'chat_id': 'user'})
-                        assert messages == (await http.get(f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user')).json()
+                        assert stable(messages) == stable((await http.get(f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user')).json())
                         assert messages['items'][0]['attachments'] == [attachment]
-                        assert await call('qq_get_session_messages', {'scene': 'c2c', 'chat_id': 'user'}) == messages
+                        assert stable(await call('qq_get_session_messages', {'scene': 'c2c', 'chat_id': 'user'})) == stable(messages)
                         assert (await call('qq_list_sessions'))['items'][0]['chat_id'] == 'user'
                         assert (await call('qq_ack_message', {'seq': seq}))['acked']
                         uploaded = await call('qq_upload_media', {'filename': 'tiny.png', 'content_base64': base64.b64encode(b'fake-image').decode()})
@@ -138,6 +153,29 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         assert (await http.get(f'http://{host}/v1/sends/mcp-turn')).json() == record
                         assert (await call('qq_send_message', send)) == record
                         assert len(fake.calls) == 1
+                        assert await call('qq_get_capabilities') == (await http.get(f'http://{host}/v1/capabilities')).json()
+                        assert await call('qq_get_profiles', {'scene': 'c2c', 'chat_id': 'user'}) == (await http.get(f'http://{host}/v1/profiles?scene=c2c&chat_id=user&limit=50&offset=0')).json()
+                        history = await call('qq_get_session_history', {'scene': 'c2c', 'chat_id': 'user'})
+                        assert stable(history) == stable((await http.get(f'http://{host}/v1/sessions/c2c/user/history?after=0&limit=50&direction=all')).json())
+                        assert len(history['items']) >= 2
+                        profile = await call('qq_get_profile', {'scene': 'c2c', 'chat_id': 'user', 'user_id': 'user'})
+                        assert profile['username'] == 'Tester'
+                        import bridge.core as core
+                        async def public_url(url, hosts):
+                            return url
+                        monkeypatch.setattr(core, 'validate_public_media_url', public_url)
+                        url_send = await call('qq_send_message', {'idempotency_key':'mcp-url-video', 'reply_to':seq,
+                            'media_url':'https://cdn.qq.com/test.mp4', 'media_kind':'video', 'filename':'test.mp4'})
+                        assert url_send['idempotency_key'] == 'mcp-url-video'
+                        for _ in range(100):
+                            url_result = await call('qq_get_send_result', {'key':'mcp-url-video'})
+                            if url_result['status'] == 'sent':
+                                break
+                            await asyncio.sleep(.02)
+                        assert url_result['status'] == 'sent'
+                        assert len(fake.calls) == 2 and fake.calls[-1][0]['media_url'] == 'https://cdn.qq.com/test.mp4'
+
+
                         invalid = [
                             ('qq_get_messages', {'limit': 201}),
                             ('qq_send_message', {**send, 'text': 'different'}),
