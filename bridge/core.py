@@ -59,6 +59,7 @@ class Settings:
     media_ttl: int = field(default_factory=lambda: env_number('BRIDGE_MEDIA_TTL_SECONDS', 86400))
     windows: dict = field(default_factory=lambda: {s: env_number('BRIDGE_REPLY_WINDOW_'+s.upper(), DEFAULT_WINDOWS[s]) for s in SCENES})
     authorized: set = field(default_factory=lambda: {v.strip() for v in os.getenv('BRIDGE_PROACTIVE_SESSIONS','').split(',') if v.strip()})
+    proactive_deny: set = field(default_factory=lambda: {v.strip() for v in os.getenv('BRIDGE_PROACTIVE_DENY','').split(',') if v.strip()})
     media_url_hosts: set = field(default_factory=lambda: {v.strip().lower() for v in os.getenv('BRIDGE_MEDIA_URL_HOSTS','').split(',') if v.strip()})
     send_interval: float = field(default_factory=lambda: env_number('BRIDGE_SEND_INTERVAL_SECONDS', 1, float))
     max_replies: int | None = field(default_factory=lambda: env_number('BRIDGE_MAX_REPLIES_PER_MESSAGE', None) if os.getenv('BRIDGE_MAX_REPLIES_PER_MESSAGE','').strip() else None)
@@ -70,6 +71,7 @@ class Settings:
             self.reply_limits[scene] = min(self.max_replies if self.max_replies is not None else self.reply_limits.get(scene,HARD_REPLIES[scene]), HARD_REPLIES[scene])
         if any(v <= 0 for v in (*self.windows.values(), *self.reply_limits.values())):
             raise RuntimeError('invalid BRIDGE_REPLY_WINDOW or BRIDGE_MAX_REPLIES limits')
+
 
 
 class TooLarge(Exception):
@@ -208,7 +210,9 @@ class Store:
         return result
 
     def proactive(self, scene, chat):
-        return f'{scene}:{chat}' in self.cfg.authorized
+        # The QQ platform decides whether a proactive message is allowed.
+        # The bridge only honours an explicit, opt-in deny list.
+        return f'{scene}:{chat}' not in self.cfg.proactive_deny
 
     def profile(self, scene, chat, user):
         row = self.db.execute('SELECT payload FROM profiles WHERE scene=? AND chat_id=? AND user_id=?',(scene,chat,user)).fetchone()
@@ -436,8 +440,8 @@ def validate_route(store, body):
         reply_id = msg['message_id']
     else:
         scene, chat_id, reply_id = body.get('scene'), body.get('chat_id'), None
-        if not scene or not chat_id or f'{scene}:{chat_id}' not in store.cfg.authorized:
-            raise HTTPException(403, 'proactive session not authorized')
+        if not scene or not chat_id or not store.proactive(scene, chat_id):
+            raise HTTPException(403, 'proactive target is in BRIDGE_PROACTIVE_DENY')
     if body.get('media_id') or body.get('media_url'):
         if scene not in ('c2c','group'):
             raise HTTPException(422, 'media supports c2c/group only')
@@ -568,7 +572,7 @@ def create_app(cfg=None, backend=None):
         return {'connected':backend.connected,'api_ready':backend.api_ready,
                 'reconnecting':backend.reconnecting,'sends':counts,'last_error':store.last_error,
                 'queue_depth':counts.get('queued',0),'current_send':dict(current) if (current := store.db.execute("SELECT s.key,d.stage FROM sends s LEFT JOIN send_details d ON s.key=d.key WHERE s.status='sending' LIMIT 1").fetchone()) else None,
-                'proactive_default':'deny','proactive_sessions':sorted(cfg.authorized)}
+                'proactive':True,'proactive_denied':sorted(cfg.proactive_deny)}
 
     @api.get('/messages')
     async def messages(after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),scene: str|None=None,chat_id: str|None=None):
@@ -603,13 +607,13 @@ def create_app(cfg=None, backend=None):
     @api.get('/capabilities')
     async def capabilities():
         return {'features':{'media_url':True,'profiles':True,'session_history':True,'manual_profile_alias':False,
-                            'platform_asr':True,'proactive_allowlist':True},
+                            'platform_asr':True,'proactive':True},
                 'scenes':{scene:{'reply_window_seconds':cfg.windows[scene],'max_replies':cfg.reply_limits[scene],
                                   'platform_max_replies':HARD_REPLIES[scene] if scene in ('c2c','group') else None,
                                   'text':True,'markdown':scene in ('c2c','group'),
                                   'media_kinds':['image','video','voice','file'] if scene in ('c2c','group') else []} for scene in SCENES},
                 'limits':{'max_file_bytes':cfg.max_file,'max_request_bytes':cfg.max_request,'max_media_bytes':cfg.max_media,'max_inline_media_bytes':4*1024*1024,'media_ttl_seconds':cfg.media_ttl},
-                'proactive_default':'deny','proactive_sessions':sorted(cfg.authorized),
+                'proactive':True,'proactive_denied':sorted(cfg.proactive_deny),
                 'media_url':{'https_only':True,'allowed_hosts':sorted(cfg.media_url_hosts),'platform_fetch':True},
                 'cursor_semantics':{'messages':'inbound_seq','session_history':'history_seq'}}
 

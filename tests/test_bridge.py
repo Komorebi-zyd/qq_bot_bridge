@@ -110,7 +110,10 @@ def test_expiry_authorization_and_validation(setup):
     assert c.post('/v1/messages/send',json={'idempotency_key':'old','reply_to':seq,'text':'x'}).status_code==409
     seq2=observe(app,'bad',timestamp='not-a-time')
     assert c.post('/v1/messages/send',json={'idempotency_key':'bad','reply_to':seq2,'text':'x'}).status_code==409
-    assert c.post('/v1/messages/send',json={'idempotency_key':'p','scene':'c2c','chat_id':'denied','text':'x'}).status_code==403
+    # Proactive targets are decided by the QQ platform; the bridge only blocks
+    # an explicit deny list.
+    assert c.post('/v1/messages/send',json={'idempotency_key':'p','scene':'c2c','chat_id':'anyone','text':'x'}).status_code==202
+    assert terminal(c,'p')['status']=='sent'
     assert c.post('/v1/messages/send',json={'idempotency_key':'a','scene':'c2c','chat_id':'allowed','text':'x'}).status_code==202
     assert terminal(c,'a')['status']=='sent'
     assert c.post('/v1/messages/send',json={'idempotency_key':'path','text':'x','path':'C:/secret'}).status_code==422

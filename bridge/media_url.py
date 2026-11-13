@@ -1,45 +1,36 @@
-"""Public HTTPS media references; validation never downloads the referenced object."""
-import asyncio
-import ipaddress
+"""Media URL handling.
+
+The QQ platform fetches the media itself, so the bridge only enforces what the
+platform requires of the link: an HTTPS direct URL. No local fetch, no DNS
+pre-check and no private-address filtering — those would block links that QQ
+would happily accept, without protecting anything on our side.
+"""
 import re
-import socket
 from urllib.parse import urlsplit
 
 
 def validate_media_url(url, allowed_hosts=None):
-    """Syntactic validation with deliberately URL-free errors (signed URLs are secrets)."""
+    """Return the host for an HTTPS media URL, or raise ValueError.
+
+    Errors never echo the URL because signed CDN links carry credentials.
+    """
     try:
-        if not isinstance(url, str) or len(url) > 8192 or re.search(r'[\s\\\x00-\x1f\x7f]', url):
+        if not isinstance(url, str) or not url or len(url) > 8192:
+            raise ValueError
+        if re.search(r'[\s\x00-\x1f\x7f]', url):
             raise ValueError
         parts = urlsplit(url)
         host = (parts.hostname or '').encode('idna').decode('ascii').lower()
         if parts.scheme != 'https' or not host or parts.username is not None or parts.password is not None:
             raise ValueError
-        if parts.port not in (None, 443) or parts.fragment or host.endswith('.'):
-            raise ValueError
-        try:
-            addr = ipaddress.ip_address(host)
-        except ValueError:
-            if '.' not in host or any(host == d or host.endswith('.'+d) for d in ('localhost','local','internal','lan','home','localdomain','test','invalid')):
-                raise ValueError
-            if len(host)>253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in host.split('.')):
-                raise ValueError
-        else:
-            if not addr.is_global or addr.is_multicast:
-                raise ValueError
         if allowed_hosts and host not in {h.strip().lower() for h in allowed_hosts if h.strip()}:
             raise ValueError
         return host
     except (ValueError, UnicodeError):
-        raise ValueError('media URL must reference an allowed public HTTPS host') from None
+        raise ValueError('media_url must be an HTTPS link to the media file') from None
 
 
 async def validate_public_media_url(url, allowed_hosts=None):
-    host = validate_media_url(url, allowed_hosts)
-    try:
-        answers = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host,443,type=socket.SOCK_STREAM), 10)
-        if not answers or any(not ipaddress.ip_address(a[4][0]).is_global or ipaddress.ip_address(a[4][0]).is_multicast for a in answers):
-            raise ValueError
-    except (OSError, ValueError, asyncio.TimeoutError):
-        raise ValueError('media URL host must resolve only to public addresses') from None
+    """Compatibility wrapper: same rules, kept async for existing call sites."""
+    validate_media_url(url, allowed_hosts)
     return url

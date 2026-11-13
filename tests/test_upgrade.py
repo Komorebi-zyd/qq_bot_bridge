@@ -13,15 +13,22 @@ from test_bridge import Fake, TOKEN, AUTH, terminal, offline_only
 
 
 @pytest.mark.parametrize('url',[
-    'http://example.com/a','https://user:secret@example.com/a','https://127.0.0.1/a',
-    'https://[::1]/a','https://169.254.169.254/a','https://10.0.0.1/a',
-    'https://localhost/a','https://x.local/a','https://x.internal/a',
-    'https://example.com:8443/a','https://example.com./a','https://example.com\\@127.0.0.1/a',
-    'https://example.com/a\n','https://2130706433/a','file:///a'])
+    'http://example.com/a','ftp://example.com/a','https://user:secret@example.com/a',
+    'https://example.com/a\n','not-a-url','','https://'])
 def test_url_syntax(url):
     with pytest.raises(ValueError) as error:
         validate_media_url(url)
-    assert url not in str(error.value)
+    if url:
+        assert url not in str(error.value)
+
+
+@pytest.mark.parametrize('url',[
+    'https://127.0.0.1/a','https://localhost/a','https://example.com:8443/a',
+    'https://169.254.169.254/a','https://[::1]/a'])
+def test_url_accepted_as_platform_requires(url):
+    # The QQ platform fetches the media, so the bridge does not add its own
+    # address filtering on top of the platform's rules.
+    assert validate_media_url(url)
 
 
 def test_signed_cdn_url_and_allowlist():
@@ -29,20 +36,6 @@ def test_signed_cdn_url_and_allowlist():
     assert validate_media_url(url)=='multimedia.nt.qq.com.cn'
     assert validate_media_url(url,{'multimedia.nt.qq.com.cn'})
     with pytest.raises(ValueError): validate_media_url(url,{'qq.com'})
-
-
-@pytest.mark.parametrize('addresses,accepted',[
-    (['8.8.8.8'],True),(['8.8.8.8','127.0.0.1'],False),(['::1'],False),([],False),(['169.254.169.254'],False)])
-def test_dns_all_answers(monkeypatch,addresses,accepted):
-    async def scenario():
-        async def resolve(*args,**kwargs):
-            return [(socket.AF_INET,socket.SOCK_STREAM,6,'',(a,443)) for a in addresses]
-        monkeypatch.setattr(asyncio.get_running_loop(),'getaddrinfo',resolve)
-        if accepted:
-            assert await validate_public_media_url('https://cdn.qq.com/a')
-        else:
-            with pytest.raises(ValueError): await validate_public_media_url('https://cdn.qq.com/a')
-    asyncio.run(scenario())
 
 
 def test_config_defaults_and_empty(monkeypatch):
@@ -72,7 +65,7 @@ def test_profiles_history_limits(tmp_path):
         assert msg['sender']['username']=='first' and msg['sender_profile']['username']=='latest'
         assert msg['sender_profile']['qq_number'] is None and 'token' not in str(msg)
         assert msg['sender']['name_source']=='official_event'
-        assert not msg['proactive_allowed'] and msg['replies_remaining']==4
+        assert msg['proactive_allowed'] and msg['replies_remaining']==4
         assert c.get('/v1/profiles?scene=c2c&chat_id=u').json()['items'][0]['username']=='latest'
         assert c.get('/v1/profiles/c2c/u/u').json()['qq_number'] is None
         assert c.get('/v1/profiles/c2c/u/missing').status_code==404
@@ -90,7 +83,7 @@ def test_profiles_history_limits(tmp_path):
         assert all(x['delivered'] and 'seq' not in x for x in history['items'][2:])
         assert len(c.get('/v1/sessions/c2c/u/history?direction=out').json()['items'])==4
         assert c.get('/v1/capabilities').json()['scenes']['c2c']['max_replies']==4
-        assert c.get('/v1/status').json()['proactive_default']=='deny'
+        assert c.get('/v1/status').json()['proactive'] is True
 
 
 def test_legacy_database_idempotent_migration(tmp_path):

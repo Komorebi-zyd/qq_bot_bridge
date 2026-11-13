@@ -179,7 +179,7 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         invalid = [
                             ('qq_get_messages', {'limit': 201}),
                             ('qq_send_message', {**send, 'text': 'different'}),
-                            ('qq_send_message', {'idempotency_key': 'denied', 'scene': 'c2c', 'chat_id': 'elsewhere', 'text': 'no'}),
+                            ('qq_send_message', {'idempotency_key': 'empty', 'reply_to': seq, 'text': '   '}),
                             ('qq_upload_media', {'filename': 'x', 'content_base64': 'invalid!'}),
                             ('qq_upload_media', {'filename': 'x', 'content_base64': ''}),
                             ('qq_upload_media', {'filename': 'x', 'content_base64': base64.b64encode(b'x' * (MAX_INLINE_MEDIA + 1)).decode()}),
