@@ -248,4 +248,6 @@ MIT
 
 ## Links
 
-- [Linux Do](https://linux.do)
+- [**Linux Do** **真诚、友善、团结、专业**，共建你我引以为荣之社区。](https://linux.do)
+- [让你的AI也能发送表情包](https://github.com/Komorebi-yaodong/ai-memes)
+- [超真实TTS免费用，注册账号使用免费模型，env中预填了三个声音~](https://github.com/Komorebi-yaodong/fishaudio-tts)
