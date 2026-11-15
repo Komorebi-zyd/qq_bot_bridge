@@ -192,7 +192,7 @@ BRIDGE_ALLOWED_HOSTS=你的域名
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | 是 | 官方机器人凭据 |
-| `BRIDGE_API_TOKEN` | 是 | 桥的访问密钥 |
+| `BRIDGE_API_TOKEN` | 是 | MCP的访问密钥 |
 | `BRIDGE_ALLOWED_HOSTS` | 用域名时 | MCP 允许的 Host，精确匹配；默认只允许 localhost |
 | `BRIDGE_ALLOWED_ORIGINS` | 否 | 客户端发 `Origin` 头时需要匹配 |
 | `BRIDGE_PROACTIVE_DENY` | 否 | 主动发送黑名单，留空即全开 |
@@ -240,14 +240,14 @@ python -m venv .venv
 
 ---
 
-## License
-
-MIT
-
----
-
 ## Links
 
 - [**Linux Do** **真诚、友善、团结、专业**，共建你我引以为荣之社区。](https://linux.do)
 - [让你的AI也能发送表情包](https://github.com/Komorebi-yaodong/ai-memes)
 - [超真实TTS免费用，注册账号使用免费模型，env中预填了三个声音~](https://github.com/Komorebi-yaodong/fishaudio-tts)
+
+---
+
+## License
+
+MIT
