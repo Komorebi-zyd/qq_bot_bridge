@@ -5,5 +5,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && useradd --uid 10001 --create-home bridge && mkdir /data && chown bridge:bridge /data
 COPY bridge ./bridge
 USER 10001:10001
+ENV PORT=8080
 EXPOSE 8080
-CMD ["uvicorn", "bridge.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--no-access-log"]
+CMD ["sh", "-c", "exec uvicorn bridge.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --no-access-log"]
