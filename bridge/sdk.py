@@ -12,9 +12,10 @@ from fastapi import HTTPException
 from qqbot_agent_sdk import EventParser, InboundEvent, QQApiClient, QQWebSocket, WSCallbacks
 from qqbot_agent_sdk import MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE, MEDIA_TYPE_FILE
 from qqbot_agent_sdk.api_client import Route
-from qqbot_agent_sdk.dto import MessageToCreate, GuildMessageToCreate, MediaInfo, MarkdownContent
+from qqbot_agent_sdk.dto import MessageToCreate, GuildMessageToCreate, MediaInfo, MarkdownContent, MessageReference
 from qqbot_agent_sdk.media_loader import MediaUploader
 from .core import Rejected, StageFailure
+from .quotes import parse_reference_metadata, normalize_inbound_quote, sanitize_elements
 from .uploader import UploadError, download_media, upload_by_url, upload_local_copy
 from .media_url import validate_public_media_url
 
@@ -162,11 +163,23 @@ class OfficialBackend:
                     mentions.append({**self.store.identity(mention,uid),'source':'sdk_event'})
         if event.chat_scope == 'group':
             asyncio.create_task(self._load_group_info(event.chat_id))
-        self.store.observe({'sender':sender,'mentions':mentions,'message_id':event.message_id,'scene':event.chat_scope,
+        own_index, _ = parse_reference_metadata(raw)
+        elements = sanitize_elements(raw['msg_elements'] if 'msg_elements' in raw else json_safe(event.msg_elements))
+        quote = normalize_inbound_quote(raw)
+        if quote is not None and 'msg_elements' not in raw:
+            quote['elements'] = elements
+        reference = raw.get('message_reference')
+        reference_id = reference.get('message_id') if isinstance(reference, dict) else None
+        safe_reference = {'message_id':str(reference_id)} if isinstance(reference_id, str) or type(reference_id) is int else None
+        item = {'sender':sender,'mentions':mentions,'message_id':event.message_id,'scene':event.chat_scope,
             'chat_id':event.chat_id,'user_id':event.user_id,'content':event.content,
             'timestamp':event.timestamp,'attachments':attachments,'asr_text':asr,
-            'msg_elements':json_safe(event.msg_elements),'message_reference':raw.get('message_reference'),
-            'event_type':event_type})
+            'msg_elements':elements,'message_reference':safe_reference,
+            'message_type':getattr(event, 'message_type', 0) if type(getattr(event, 'message_type', 0)) is int else 0,
+            'reference_index':own_index,'event_type':event_type}
+        if quote is not None:
+            item['quote'] = quote
+        self.store.observe(item)
 
     async def _load_group_info(self, chat_id):
         """Fetch the group name once per conversation.
@@ -288,6 +301,15 @@ class OfficialBackend:
         def stage(value):
             if key:
                 self.store.set_send_stage(key,value)
+        def quote_index():
+            from .core import resolve_quote
+            try:
+                return resolve_quote(self.store, body, scene, chat_id)
+            except HTTPException:
+                raise StageFailure('validate', reason='quote target unavailable or invalid') from None
+        # Fail before any upload; resolve again immediately before sending because
+        # media upload may take time and a stored target may have changed.
+        quote_index()
         msg_seq = body.get('_msg_seq') or (1 if reply_id else QQApiClient.next_msg_seq())
         if body.get('media_id') or body.get('media_url'):
             stage('validate')
@@ -316,6 +338,9 @@ class OfficialBackend:
             if body['markdown']:
                 msg.msg_type, msg.content = 2, ''
                 msg.markdown = MarkdownContent(content=body['text'])
+        index = quote_index()
+        if index is not None:
+            msg.message_reference = MessageReference(message_id=index)
         stage('send')
         try:
             if scene=='c2c':

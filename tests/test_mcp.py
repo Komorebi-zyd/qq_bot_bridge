@@ -45,7 +45,7 @@ class Fake:
 
     async def send(self, body, route):
         self.calls.append((body, route))
-        return {'id': 'fake-only'}
+        return {'id': 'fake-only', 'ext_info': {'ref_idx': 'REFIDX_fake_sent'}}
 
 
 def make_app(tmp_path, monkeypatch, host='testserver'):
@@ -104,7 +104,8 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
         attachment = {'url': 'https://cdn.example/real.png', 'content_type': 'image/jpeg',
                       'filename': 'real.jpg', 'size': 1234, 'voice_wav_url': 'https://cdn.example/voice.wav'}
         seq = app.state.store.observe(dict(message_id='incoming', scene='c2c', chat_id='user',
-            user_id='user', content='hello', sender={'username':'Tester'}, attachments=[attachment], timestamp=iso()))
+            user_id='user', content='hello', sender={'username':'Tester'}, attachments=[attachment], timestamp=iso(),
+            reference_index='REFIDX_incoming'))
         server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False))
         task = asyncio.create_task(server.serve(sockets=[sock]))
         try:
@@ -127,7 +128,7 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                             assert tool.description and len(tool.description) < 220
                             assert not any(word in tool.description for word in negative), tool.name
                         send_tool = next(t for t in tools.tools if t.name == 'qq_send_message')
-                        assert {'media_url', 'filename'} <= set(send_tool.inputSchema['properties'])
+                        assert {'media_url', 'filename', 'quote_to', 'quote_key'} <= set(send_tool.inputSchema['properties'])
 
                         async def call(name, args=None):
                             result = await session.call_tool(name, args or {})
@@ -197,6 +198,28 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                             await asyncio.sleep(.02)
                         assert url_result['status'] == 'sent'
                         assert len(fake.calls) == 2 and fake.calls[-1][0]['media_url'] == 'https://cdn.qq.com/test.mp4'
+                        quoted = app.state.store.observe(dict(message_id='quoted-turn',scene='c2c',chat_id='user',user_id='user',
+                            content='你怎么看',timestamp=iso(),reference_index='REFIDX_new',quote={'reference_index':'REFIDX_incoming',
+                            'elements':[{'content':'hello','author':{'user_id':'user','username':'Tester'}}]}))
+                        page = await call('qq_get_messages', {'after':seq})
+                        assert page['items'][0]['quote']['text']=='hello'
+                        assert page['items'][0]['quote']['seq']==seq
+                        assert 'REFIDX' not in json.dumps(page)
+                        quote_send=dict(idempotency_key='quoted-send',reply_to=quoted,quote_to=seq,text='针对原消息回答')
+                        assert (await call('qq_send_message',quote_send))['key']=='quoted-send'
+                        for _ in range(100):
+                            qs=await call('qq_get_send_result',{'key':'quoted-send'})
+                            if qs['status']=='sent': break
+                            await asyncio.sleep(.02)
+                        assert qs['status']=='sent' and fake.calls[-1][0]['quote_to']==seq
+                        outgoing_quote=dict(idempotency_key='quoted-own',scene='c2c',chat_id='user',quote_key='mcp-turn',text='补充我之前的回复')
+                        assert (await call('qq_send_message',outgoing_quote))['key']=='quoted-own'
+                        for _ in range(100):
+                            qo=await call('qq_get_send_result',{'key':'quoted-own'})
+                            if qo['status']=='sent': break
+                            await asyncio.sleep(.02)
+                        assert qo['status']=='sent' and fake.calls[-1][0]['quote_key']=='mcp-turn'
+
 
                         invalid = [
                             ('qq_get_messages', {'limit': 201}),

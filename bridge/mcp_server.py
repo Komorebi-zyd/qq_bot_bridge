@@ -75,7 +75,7 @@ def attach_mcp(app):
     @mcp.tool(structured_output=False)
     async def qq_get_messages(after: int = 0, limit: int = 20, scene: Scene | None = None,
             chat_id: str | None = None, detail: Detail = 'lite') -> dict[str, Any]:
-        """按游标读取新消息，含发言人、正文、附件链接与回复状态。after 为上次 next_cursor。detail=lite 精简，full 返回原始字段。"""
+        """按游标读取新消息，含发言人、正文、引用上下文、附件链接与回复状态。after 为上次 next_cursor。detail=lite 精简，full 返回原始字段。"""
         params = {'after': after, 'limit': limit, 'detail': detail}
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id}.items() if v is not None})
         return await request('GET', '/v1/messages', params=params)
@@ -102,11 +102,13 @@ def attach_mcp(app):
             scene: Scene | None = None, chat_id: str | None = None, media_id: str | None = None,
             media_kind: MediaKind | None = None, markdown: bool = False,
             media_url: str | None = None, filename: str | None = None,
-            detail: Detail = 'lite') -> dict[str, Any]:
-        """发送文字、图片、视频、语音或文件。回复使用 reply_to；主动联系使用 scene 和 chat_id；媒体可传 media_url 直链或已上传的 media_id。idempotency_key 标识一次发送动作。"""
+            detail: Detail = 'lite', quote_to: int | None = None,
+            quote_key: str | None = None) -> dict[str, Any]:
+        """发送文字或富媒体。reply_to 使用原消息回复额度；quote_to 引用收到的消息，quote_key 引用自己发送的消息，在 QQ 展示引用框。主动联系填 scene/chat_id，媒体填 media_url 或 media_id。"""
         return await request('POST', '/v1/messages/send', json=dict(idempotency_key=idempotency_key,
             text=text, reply_to=reply_to, scene=scene, chat_id=chat_id, media_id=media_id,
-            media_kind=media_kind, markdown=markdown, media_url=media_url, filename=filename),
+            media_kind=media_kind, markdown=markdown, media_url=media_url, filename=filename,
+            quote_to=quote_to, quote_key=quote_key),
             params={'detail': detail})
 
     @mcp.tool(structured_output=False)

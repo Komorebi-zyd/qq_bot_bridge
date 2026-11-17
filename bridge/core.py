@@ -40,6 +40,54 @@ HARD_REPLIES = dict(c2c=4, group=5, guild=5, dm=5)
 DEFAULT_WINDOWS = dict(c2c=3600, group=300, guild=300, dm=300)
 
 
+def _reference_index(value):
+    # Reference indexes are platform tokens, not passive ROBOT message IDs.
+    if type(value) is int and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.strip() and not any(ord(c) < 32 for c in value):
+        return value
+    return None
+
+
+def _message_reference_index(record):
+    index = _reference_index(record.get('reference_index'))
+    if index is not None:
+        return index
+    index = _reference_index(record.get('msg_idx'))
+    if index is not None:
+        return index
+    scene = record.get('message_scene')
+    if not isinstance(scene, dict):
+        return None
+    index = _reference_index(scene.get('msg_idx'))
+    if index is not None:
+        return index
+    ext = scene.get('ext')
+    for value in ext if isinstance(ext, list) else []:
+        if not isinstance(value, str):
+            continue
+        key, separator, token = value.partition('=')
+        if separator and key == 'msg_idx':
+            index = _reference_index(token)
+            if index is not None:
+                return index
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            index = _reference_index(parsed.get('msg_idx'))
+            if index is not None:
+                return index
+    return None
+
+
+def _send_reference_index(result):
+    if isinstance(result, dict) and isinstance(result.get('ext_info'), dict):
+        return _reference_index(result['ext_info'].get('ref_idx'))
+    return None
+
+
 def env_number(name, default, cast=int):
     raw = os.getenv(name, '').strip()
     try:
@@ -169,6 +217,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS history(history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
           scene TEXT,chat_id TEXT,direction TEXT,inbound_seq INTEGER UNIQUE,send_key TEXT UNIQUE);
         CREATE INDEX IF NOT EXISTS session_history ON history(scene,chat_id,history_seq);
+        CREATE TABLE IF NOT EXISTS reference_lookup(scene TEXT NOT NULL,chat_id TEXT NOT NULL,
+          reference_index TEXT NOT NULL,inbound_seq INTEGER,send_key TEXT,
+          PRIMARY KEY(scene,chat_id,reference_index));
         """)
         fresh_history = not self.db.execute('SELECT 1 FROM history LIMIT 1').fetchone()
         backlog = []
@@ -233,12 +284,21 @@ class Store:
                 profile.update(scene=row['scene'],chat_id=row['chat_id'],updated_at=item.get('received_at') or item.get('timestamp'))
                 self.db.execute('INSERT OR REPLACE INTO profiles VALUES(?,?,?,?)',(row['scene'],row['chat_id'],user,json.dumps(profile)))
             self.db.execute("INSERT OR IGNORE INTO history(scene,chat_id,direction,inbound_seq) VALUES(?,?,'in',?)",(row['scene'],row['chat_id'],seq))
+            index = _message_reference_index(item)
+            if index is not None:
+                self.db.execute('INSERT OR IGNORE INTO reference_lookup VALUES(?,?,?,?,NULL)',
+                                (row['scene'],row['chat_id'],index,seq))
 
     def index_send(self, key):
         route = self.db.execute('SELECT scene,chat_id FROM send_routes WHERE key=?',(key,)).fetchone()
         if route and route['scene'] and route['chat_id']:
             with self.db:
                 self.db.execute("INSERT OR IGNORE INTO history(scene,chat_id,direction,send_key) VALUES(?,?,'out',?)",(*route,key))
+                send = self.db.execute('SELECT status,result FROM sends WHERE key=?',(key,)).fetchone()
+                index = _send_reference_index(json.loads(send['result'])) if send and send['status']=='sent' and send['result'] else None
+                if index is not None:
+                    self.db.execute('INSERT OR IGNORE INTO reference_lookup VALUES(?,?,?,NULL,?)',
+                                    (*route,index,key))
 
     def reply_count(self, seq):
         return self.db.execute('SELECT COUNT(*) FROM send_routes WHERE reply_to=?',(seq,)).fetchone()[0]
@@ -264,7 +324,7 @@ class Store:
             else:
                 send = self.db.execute('SELECT payload,status,created_at,updated_at FROM sends WHERE key=?',(row['send_key'],)).fetchone()
                 body = json.loads(send['payload'])
-                entry = {k:body.get(k) for k in ('text','media_id','media_kind','filename','reply_to')}
+                entry = {k:body.get(k) for k in ('text','media_id','media_kind','filename','reply_to','quote_to','quote_key')}
                 # History doesn't replicate signed media URLs.
                 entry.update(created_at=send['created_at'],updated_at=send['updated_at'],timestamp=send['updated_at'],idempotency_key=row['send_key'],status=send['status'],delivered=send['status']=='sent',kind='message' if send['status']=='sent' else 'send_attempt',media_source='url' if body.get('media_url') else 'local' if body.get('media_id') else None)
             items.append({**entry,'history_seq':row['history_seq'],'direction':row['direction'],'scene':scene,'chat_id':chat})
@@ -350,7 +410,62 @@ class Store:
                     can_reply=remaining>0 and quota>0, reply_remaining_seconds=int(remaining),
                     replies_remaining=quota, proactive_allowed=self.proactive(item['scene'],item['chat_id']),
                     sender_profile=self.profile(item['scene'],item['chat_id'],item.get('user_id','')))
+        self.enrich_quote(item)
         return item
+
+    def enrich_quote(self, item):
+        quote = item.get('quote')
+        if not isinstance(quote, dict):
+            # Older payloads may retain explicit references, but msgtype 103 and
+            # msg_elements alone are not evidence that this message is a quote.
+            reference = item.get('message_reference')
+            explicit = isinstance(reference, dict) and bool(reference)
+            index = _reference_index(item.get('ref_msg_idx'))
+            scene = item.get('message_scene')
+            ext = scene.get('ext') if isinstance(scene, dict) else None
+            for value in ext if isinstance(ext, list) else []:
+                if isinstance(value, str) and value.startswith('ref_msg_idx='):
+                    index = index or _reference_index(value.partition('=')[2])
+            if isinstance(reference, dict):
+                index = index or _reference_index(reference.get('ref_msg_idx')) or _reference_index(reference.get('msg_idx')) or _reference_index(reference.get('message_id'))
+            if not explicit and index is None:
+                return
+            elements = item.get('msg_elements')
+            quote = {'source':'explicit','elements':self.quote_elements(elements)}
+            if index is not None:
+                quote['reference_index'] = index
+        else:
+            quote = dict(quote)
+        index = _reference_index(quote.get('reference_index'))
+        if index is not None:
+            match = self.db.execute('SELECT inbound_seq,send_key FROM reference_lookup WHERE scene=? AND chat_id=? AND reference_index=?',
+                                    (item['scene'],item['chat_id'],index)).fetchone()
+            if match:
+                if match['inbound_seq'] is not None:
+                    quote['seq'] = match['inbound_seq']
+                if match['send_key'] is not None:
+                    quote['key'] = match['send_key']
+        item['quote'] = quote
+
+    @classmethod
+    def quote_elements(cls, elements, depth=0):
+        if not isinstance(elements, list) or depth >= 8:
+            return []
+        result = []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            author = element.get('author')
+            author = author if isinstance(author, dict) else {}
+            uid = next((author[k] for k in ('user_id','user_openid','member_openid','id') if isinstance(author.get(k), str)), '')
+            entry = {'content':element.get('content') if isinstance(element.get('content'),str) else '',
+                     'author':cls.identity(author,uid),
+                     'attachments':element.get('attachments') if isinstance(element.get('attachments'),list) else []}
+            nested = element.get('elements',element.get('msg_elements'))
+            if isinstance(nested, list):
+                entry['elements'] = cls.quote_elements(nested,depth+1)
+            result.append(entry)
+        return result
 
     def messages(self, after, limit, scene=None, chat_id=None):
         sql, args = 'SELECT seq FROM messages WHERE seq>?', [after]
@@ -401,6 +516,8 @@ class SendRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     idempotency_key: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9._:-]+$')
     reply_to: int | None = Field(default=None, gt=0)
+    quote_to: int | None = Field(default=None, gt=0, strict=True)
+    quote_key: str | None = Field(default=None, min_length=1, max_length=128, pattern=r'^[A-Za-z0-9._:-]+$')
     scene: Literal['c2c','group','guild','dm'] | None = None
     chat_id: str | None = Field(default=None, min_length=1, max_length=256)
     text: str = Field(default='', max_length=2000)
@@ -412,6 +529,8 @@ class SendRequest(BaseModel):
 
     @model_validator(mode='after')
     def valid(self):
+        if self.quote_to is not None and self.quote_key is not None:
+            raise ValueError('quote_to and quote_key are mutually exclusive')
         if self.media_id and self.media_url:
             raise ValueError('media_id and media_url are mutually exclusive')
         if bool(self.media_id or self.media_url) != bool(self.media_kind):
@@ -441,6 +560,45 @@ class Rejected(StageFailure):
 
 
 
+def resolve_quote(store, body, scene, chat_id):
+    """Resolve a quote independently of passive reply routing; never guess IDs.
+
+    Called during enqueue validation and by the SDK immediately before posting.
+    Returns the platform reference index, not the inbound ROBOT message ID.
+    """
+    quote_to, quote_key = body.get('quote_to'), body.get('quote_key')
+    if quote_to is None and quote_key is None:
+        return None
+    if quote_to is not None and quote_key is not None:
+        raise HTTPException(422, 'quote_to and quote_key are mutually exclusive')
+    if scene not in ('c2c','group'):
+        raise HTTPException(422, 'quotes support c2c/group only')
+    if quote_to is not None:
+        if type(quote_to) is not int or quote_to <= 0:
+            raise HTTPException(422, 'quote_to must be a positive integer')
+        row = store.db.execute('SELECT scene,chat_id,payload FROM messages WHERE seq=?',(quote_to,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'quote message not found')
+        if (row['scene'],row['chat_id']) != (scene,chat_id):
+            raise HTTPException(409, 'quote message belongs to another conversation')
+        index = _message_reference_index(json.loads(row['payload']))
+    else:
+        if not isinstance(quote_key, str) or not quote_key:
+            raise HTTPException(422, 'quote_key must be a nonempty string')
+        row = store.db.execute('SELECT status,result FROM sends WHERE key=?',(quote_key,)).fetchone()
+        if row is None:
+            raise HTTPException(404, 'quote send not found')
+        route = store.db.execute('SELECT scene,chat_id FROM send_routes WHERE key=?',(quote_key,)).fetchone()
+        if route is None or (route['scene'],route['chat_id']) != (scene,chat_id):
+            raise HTTPException(409, 'quote send route unavailable or belongs to another conversation')
+        if row['status'] != 'sent':
+            raise HTTPException(409, 'quote send has not been sent')
+        index = _send_reference_index(json.loads(row['result'])) if row['result'] else None
+    if index is None:
+        raise HTTPException(409, 'quote reference index unavailable')
+    return index
+
+
 def validate_route(store, body):
     if body.get('reply_to'):
         msg = store.message(body['reply_to'])
@@ -455,6 +613,7 @@ def validate_route(store, body):
         scene, chat_id, reply_id = body.get('scene'), body.get('chat_id'), None
         if not scene or not chat_id or not store.proactive(scene, chat_id):
             raise HTTPException(403, 'proactive target is in BRIDGE_PROACTIVE_DENY')
+    resolve_quote(store, body, scene, chat_id)
     if body.get('media_id') or body.get('media_url'):
         if scene not in ('c2c','group'):
             raise HTTPException(422, 'media supports c2c/group only')
@@ -635,7 +794,7 @@ def create_app(cfg=None, backend=None):
     @api.get('/capabilities')
     async def capabilities(detail: Detail='full'):
         caps = {'features':{'media_url':True,'profiles':True,'session_history':True,'manual_profile_alias':False,
-                            'platform_asr':True,'proactive':True},
+                            'platform_asr':True,'proactive':True,'quote_receive':True,'quote_send':True},
                 'scenes':{scene:{'reply_window_seconds':cfg.windows[scene],'max_replies':cfg.reply_limits[scene],
                                   'platform_max_replies':HARD_REPLIES[scene] if scene in ('c2c','group') else None,
                                   'text':True,'markdown':scene in ('c2c','group'),

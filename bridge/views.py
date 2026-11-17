@@ -96,6 +96,63 @@ def lean_sender(record):
     return out
 
 
+
+def lean_quote_element(element):
+    """Project quoted content without repeating platform indices or metadata."""
+    out = {}
+    author = element.get('author') or {}
+    sender = {}
+    uid = author.get('user_id') or author.get('member_openid') or author.get('user_openid') or author.get('id')
+    if uid:
+        sender['id'] = uid
+    if author.get('username'):
+        sender['name'] = author['username']
+    if sender:
+        out['from'] = sender
+    text = normalize_text(element.get('content') or element.get('text'), element.get('mentions'))
+    if text and text.strip():
+        out['text'] = text
+    raw_attachments = [a for a in element.get('attachments') or [] if isinstance(a, dict)]
+    attachments = [lean_attachment(a) for a in raw_attachments if not a.get('truncated')]
+    if attachments:
+        out['attachments'] = attachments
+    if any(a.get('truncated') for a in raw_attachments):
+        out['truncated'] = True
+    if element.get('asr_text'):
+        out['asr'] = element['asr_text']
+    children = [lean_quote_element(e) for e in element.get('elements') or element.get('msg_elements') or [] if isinstance(e, dict)]
+    children = [c for c in children if c]
+    if children:
+        out['elements'] = children
+    if element.get('truncated'):
+        out['truncated'] = True
+    return out
+
+
+def lean_quote(record):
+    quote = record.get('quote')
+    # Legacy archives may have a reference marker and SDK-parsed elements.
+    if not isinstance(quote, dict):
+        reference = record.get('message_reference') or {}
+        if not reference.get('message_id'):
+            return None
+        quote = {'elements':record.get('msg_elements') or []}
+    elements = [lean_quote_element(e) for e in quote.get('elements') or [] if isinstance(e, dict)]
+    elements = [e for e in elements if e]
+    result = {}
+    if len(elements) == 1:
+        result.update(elements[0])
+    elif elements:
+        result['elements'] = elements
+    for key in ('seq', 'key'):
+        if quote.get(key) is not None:
+            result[key] = quote[key]
+    if quote.get('truncated'):
+        result['truncated'] = True
+    # An explicit unresolved reference is meaningful even when no snapshot arrived.
+    return result or {'available':False}
+
+
 def lean_message(record):
     out = {'seq': record.get('seq')}
     text = normalize_text(record.get('content'), record.get('mentions'))
@@ -109,9 +166,9 @@ def lean_message(record):
         out['attachments'] = attachments
     if record.get('asr_text'):
         out['asr'] = record['asr_text']
-    reference = record.get('message_reference') or {}
-    if reference.get('message_id'):
-        out['quoted'] = reference['message_id']
+    quote = lean_quote(record)
+    if quote is not None:
+        out['quote'] = quote
     if record.get('acked'):
         out['acked'] = True
     out['can_reply'] = bool(record.get('can_reply'))
@@ -132,6 +189,10 @@ def lean_outbound(entry):
         out['filename'] = entry['filename']
     if entry.get('reply_to'):
         out['reply_to'] = entry['reply_to']
+    if entry.get('quote_to') is not None:
+        out['quote_to'] = entry['quote_to']
+    if entry.get('quote_key'):
+        out['quote_key'] = entry['quote_key']
     if entry.get('at') or entry.get('timestamp'):
         out['at'] = entry.get('at') or entry.get('timestamp')
     return out
@@ -216,4 +277,6 @@ def lean_capabilities(caps):
         out['media_hosts'] = media['allowed_hosts']
     if caps.get('proactive'):
         out['proactive'] = True
+    if (caps.get('features') or {}).get('quote_send'):
+        out['quotes'] = True
     return out

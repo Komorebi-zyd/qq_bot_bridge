@@ -21,7 +21,7 @@
 | qq_get_send_result | 发送阶段与结果 | GET /v1/sends/{key} |
 | qq_upload_media | 标准 Base64 小文件上传 | POST /v1/media multipart |
 
-MCP description 聚焦功能与参数。以下约定解释状态、权限与游标。工具响应提供 structuredContent 和文本兼容内容。
+MCP description 聚焦功能与参数。以下约定解释状态、权限与游标。工具响应只返回一份 JSON 文本，保持精简。
 
 ### detail=lite 与 detail=full
 
@@ -97,7 +97,46 @@ lite 消息结构：
 - text 最多2000字符，可纯文字、纯媒体或媒体附文字。
 - 媒体来源二选一：media_url（公网HTTPS文件直链）或 media_id（上传结果），同时指定 media_kind=image/voice/video/file。
 - filename 为可选文件名元数据。
+- quote_to 或 quote_key 用于 QQ 引用框，分别指定收到的消息 seq 或已发送动作 key。
 - Markdown 用于 C2C/group 文字。媒体一次一份，C2C/group 支持。
+
+### QQ 引用消息
+
+接收到用户的引用回复时，lite 消息增加 `quote`，只在有明确引用标记时输出：
+
+```json
+{
+  "seq":42,
+  "text":"这个方案怎么样？",
+  "from":{"id":"u1","name":"小明"},
+  "quote":{
+    "seq":8,
+    "from":{"id":"u2","name":"小红"},
+    "text":"周末去爬山",
+    "attachments":[{"kind":"image","url":"https://cdn.example.com/a.jpg"}]
+  }
+}
+```
+
+`quote.seq` 对应已经接收的原消息，`quote.key` 对应机器人此前发送的消息，匹配到本地索引时才出现。引用内容由官方事件快照提供，包含作者、文本、附件和嵌套内容；快照尚未提供时标记 `available:false`。普通的上下文消息元素与显式引用分开处理。
+
+发送引用框使用 `quote_to` 或 `quote_key`：
+
+```json
+{"idempotency_key":"quote-42-v1","reply_to":42,"quote_to":8,"text":"我针对这句话回答。"}
+```
+
+```json
+{"idempotency_key":"quote-own-v1","scene":"group","chat_id":"群OpenID","quote_key":"之前成功发送的key","text":"补充我刚才的回答。"}
+```
+
+- `reply_to`：使用哪条收到的消息的被动回复额度与路由。
+- `quote_to`：在 QQ 显示引用框，引用某条收到的消息（填入站 seq）。
+- `quote_key`：在 QQ 显示引用框，引用机器人成功发送的消息（填该动作 key）。
+- 两个引用参数选其一。当前在 C2C/group 支持文字、Markdown 和媒体的引用发送。
+- 桥内部把入站的 `message_scene.ext.msg_idx` 和出站的 `ext_info.ref_idx` 转成官方 `message_reference.message_id`。调用方只提交 seq/key。
+- 原始 `message_id`（ROBOT1.0）与引用索引不同；旧记录当时未保存入站 msg_idx 时会返回“引用索引不可用”，收到一条新消息即可测试新版引用链路。
+- 引用目标来自当前会话，回复资格和引用展示独立。主动引用依旧走当前主动消息路径，实际展示和有效性以 QQ 平台结果为准。
 
 ### URL
 

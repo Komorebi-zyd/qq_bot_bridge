@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6E56CF)
 ![Tools](https://img.shields.io/badge/tools-12-2ea44f)
-![Tests](https://img.shields.io/badge/tests-88%20passed-2ea44f)
+![Tests](https://img.shields.io/badge/tests-163%20passed-2ea44f)
 ![Deploy](https://img.shields.io/badge/deploy-single%20container-0b7285)
 ![Official](https://img.shields.io/badge/route-official%20Bot%20API-e8590c)
 
@@ -42,6 +42,7 @@ QQ 用户  ←→  QQ 开放平台  ←→  这个容器  ←→  你的 Agent
 | 认识人 | 昵称、头像、群内角色；同名靠 ID 区分 |
 | 认识群 | 群名称、群人数、群成员列表 |
 | 双向历史 | 谁说过什么，双向可查，游标独立 |
+| 引用对话 | 读懂被引用的正文和附件，也能引用用户或机器人之前的消息 |
 | 媒体直链 | `media_url` 一句话发视频，不用 Base64 |
 | 自动回退 | 平台抓不到链接，桥自己下载后分片上传 |
 | 精确诊断 | 850026 是下载失败，850019 是格式不支持 |
@@ -139,6 +140,19 @@ URL：https://你的域名/mcp
 }
 ```
 
+**带引用框回复**
+
+```json
+{
+  "idempotency_key": "quote-42-v1",
+  "reply_to": 42,
+  "quote_to": 42,
+  "text": "我针对你这句话回答"
+}
+```
+
+`reply_to` 选择被动回复额度，`quote_to` 在 QQ 显示原消息引用框。引用机器人自己发过的话时，使用 `quote_key` 填此前发送的动作 key。用户引用回复时，拉回来的 `quote` 包含被引用正文、作者和附件，Agent 可以接着上下文聊。
+
 **拉回来的消息长这样**
 
 ```json
@@ -227,7 +241,7 @@ python -m venv .venv
 .venv\Scripts\python -m pytest -q
 ```
 
-88 项离线测试，覆盖官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、错误码解析、标记清洗。不需要真实凭据，不向 QQ 发消息。
+163 项离线测试，覆盖官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、错误码解析、标记清洗与引用收发。不需要真实凭据，不向 QQ 发消息。
 
 ---
 
