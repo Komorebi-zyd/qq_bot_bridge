@@ -177,3 +177,17 @@ MCP `qq_upload_media(filename,content_base64)` 标准Base64，解码最多4MiB�
 默认C2C3600秒/4次，群300秒/5次；频道/频道私信300秒，桥端预留次数上限5。平台实际规则可能收紧。可用BRIDGE_REPLY_WINDOW_<SCENE>、BRIDGE_MAX_REPLIES_<SCENE>配置；旧统一BRIDGE_MAX_REPLIES_PER_MESSAGE可收紧全部场景。能力接口返回生效值。每条原消息使用持久化预留msg_seq，重启保留。
 
 默认采用精确会话授权，媒体URL校验独立于Host/Origin；`BRIDGE_ALLOWED_HOSTS` / `BRIDGE_ALLOWED_ORIGINS` 用于MCP传输域名校验。403/409/413/422对应权限、冲突/时效、大小、参数问题。收到的文字与附件由宿主按用户授权使用；桥凭据通过私密配置传递。
+
+## 数据库存储
+
+环境变量 `BRIDGE_DATABASE_URL` 配置 PostgreSQL URI（`postgres://` 或 `postgresql://`），留空时使用 `BRIDGE_DATA_DIR/bridge.sqlite3`。服务自动建表，保持 MCP 与 REST 的消息编号、游标和幂等 key 语义。
+
+`qq_status` / `GET /v1/status` 新增：
+
+```json
+{"storage":{"backend":"postgresql","active":true}}
+```
+
+滚动部署等待接管时 `active:false`，数据接口返回 503；`GET /health` 为存活检查，正常返回 200。数据库连接故障的数据请求返回脱敏 503。平台环境面板保存真实 URI，日志与状态响应只报告后端名称。
+
+持久化范围：消息及 ack、收发历史、发送队列和幂等状态、资料/群缓存、引用索引、网关恢复状态、上传元数据。上传文件字节仍使用本地目录，`media_url` 可独立于本地上传缓存使用。后端切换不自动搬迁历史数据。

@@ -5,8 +5,9 @@ import logging
 import re
 import os
 import secrets
-import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .media_url import validate_media_url, validate_public_media_url
 from . import views
+from .database import open_database, DatabaseError
+from .ownership import DatabaseOwner, DatabaseOwnershipLost
 
 
 def iso(t=None):
@@ -102,7 +105,8 @@ def env_number(name, default, cast=int):
 @dataclass
 class Settings:
     data: Path = field(default_factory=lambda: Path(os.getenv('BRIDGE_DATA_DIR', '/data').strip() or '/data'))
-    token: str = field(default_factory=lambda: os.getenv('BRIDGE_API_TOKEN', '').strip())
+    token: str = field(default_factory=lambda: os.getenv('BRIDGE_API_TOKEN', '').strip(), repr=False)
+    database_url: str = field(default_factory=lambda: os.getenv('BRIDGE_DATABASE_URL', '').strip(), repr=False)
     max_file: int = field(default_factory=lambda: env_number('BRIDGE_MAX_FILE_BYTES', 20*1024*1024))
     max_request: int = field(default_factory=lambda: env_number('BRIDGE_MAX_REQUEST_BYTES', 21*1024*1024))
     max_media: int = field(default_factory=lambda: env_number('BRIDGE_MAX_MEDIA_BYTES', 256*1024*1024))
@@ -185,8 +189,63 @@ class Store:
         cfg.data.mkdir(parents=True, exist_ok=True)
         self.media_dir = cfg.data / 'media'
         self.media_dir.mkdir(exist_ok=True)
-        self.db = sqlite3.connect(cfg.data/'bridge.sqlite3', check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self.db = open_database(cfg)
+        self.remote = getattr(self.db, 'dialect', 'sqlite') == 'postgresql'
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-db")
+        self._closing = False
+        self._close_task = None
+        self.initialized = False
+        if not self.remote:
+            self.initialize()
+
+    async def call(self, fn, *args, **kw):
+        """Run a complete synchronous operation, never a transaction fragment.
+
+        A Store has one connection and one executor thread. Cancellation waits for
+        an already submitted operation to finish before lifecycle cleanup proceeds.
+        SQLite deliberately retains its synchronous, backwards-compatible path.
+        """
+        if self._closing:
+            raise DatabaseError('Database connection is closed')
+        if not self.remote:
+            return fn(*args, **kw)
+        future = asyncio.get_running_loop().run_in_executor(
+            self._executor, partial(fn, *args, **kw))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # A running DB-API operation cannot be cancelled. Drain it so callers
+            # cannot reset/close the session or remove upload files underneath it.
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                pass
+            raise
+
+    async def close(self):
+        """Drain queued operations, close on the DB thread, then join it safely."""
+        if self._close_task is None:
+            self._closing = True
+
+            async def finish():
+                try:
+                    if self.remote:
+                        await asyncio.get_running_loop().run_in_executor(
+                            self._executor, self.db.close)
+                    else:
+                        self.db.close()
+                finally:
+                    await asyncio.to_thread(self._executor.shutdown, wait=True)
+
+            self._close_task = asyncio.create_task(finish())
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._close_task)
+            raise
+
+    def initialize(self):
+        # Called only by the active PostgreSQL owner during rolling deployments.
         self.db.executescript("""
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=FULL;
@@ -202,9 +261,22 @@ class Store:
         CREATE TABLE IF NOT EXISTS metadata(namespace TEXT NOT NULL,key TEXT NOT NULL,
           value TEXT NOT NULL,PRIMARY KEY(namespace,key));
         """)
+        interrupted = [r[0] for r in self.db.execute("SELECT key FROM sends WHERE status='sending'")]
         self.db.execute("UPDATE sends SET status='unknown',error='process interrupted during send',updated_at=? WHERE status='sending'", (iso(),))
         self.db.commit()
         self.upgrade()
+        for key in interrupted:
+            self.index_send(key)
+            self.set_send_stage(key, 'unknown')
+        # A process can stop after persisting a final result but before indexing
+        # its history/reference. Reconcile only that small unfinished subset.
+        unindexed_messages = self.db.execute("SELECT m.seq FROM messages m LEFT JOIN history h ON h.inbound_seq=m.seq WHERE h.inbound_seq IS NULL ORDER BY m.seq").fetchall()
+        for row in unindexed_messages:
+            self.index_message(row[0])
+        missing = self.db.execute("SELECT s.key FROM sends s LEFT JOIN history h ON h.send_key=s.key WHERE s.status IN ('sent','failed','unknown') AND h.send_key IS NULL").fetchall()
+        for row in missing:
+            self.index_send(row[0])
+        self.initialized = True
 
     def upgrade(self):
         # Keep legacy tables/column counts untouched. Re-running this migration is safe.
@@ -221,6 +293,10 @@ class Store:
           reference_index TEXT NOT NULL,inbound_seq INTEGER,send_key TEXT,
           PRIMARY KEY(scene,chat_id,reference_index));
         """)
+        if self.remote:
+            version = self.db.execute("SELECT value FROM metadata WHERE namespace='bridge_schema' AND key='version'").fetchone()
+            if version and version[0] == 'postgres-v1':
+                return
         fresh_history = not self.db.execute('SELECT 1 FROM history LIMIT 1').fetchone()
         backlog = []
         for row in self.db.execute('SELECT seq,payload FROM messages ORDER BY seq').fetchall():
@@ -229,7 +305,7 @@ class Store:
                 backlog.append((epoch(item.get('received_at')) or epoch(item.get('timestamp')) or 0, 0, row['seq']))
             else:
                 self.index_message(row['seq'])
-        for row in self.db.execute('SELECT * FROM sends ORDER BY rowid').fetchall():
+        for row in self.db.execute('SELECT * FROM sends ORDER BY created_at,key').fetchall():
             body = json.loads(row['payload'])
             scene, chat = body.get('scene'), body.get('chat_id')
             if body.get('reply_to'):
@@ -237,9 +313,9 @@ class Store:
                 if original:
                     scene, chat = original
             with self.db:
-                self.db.execute('INSERT OR IGNORE INTO send_routes VALUES(?,?,?,?)',(row['key'],scene,chat,body.get('reply_to')))
+                self.db.execute('INSERT INTO send_routes VALUES(?,?,?,?) ON CONFLICT(key) DO NOTHING',(row['key'],scene,chat,body.get('reply_to')))
                 ordinal = self.db.execute('SELECT COUNT(*) FROM send_routes WHERE reply_to=?',(body.get('reply_to'),)).fetchone()[0] if body.get('reply_to') else None
-                self.db.execute('INSERT OR IGNORE INTO send_details VALUES(?,?,?,NULL)',(row['key'],row['status'],ordinal))
+                self.db.execute('INSERT INTO send_details VALUES(?,?,?,NULL) ON CONFLICT(key) DO NOTHING',(row['key'],row['status'],ordinal))
             if row['status'] in ('sent','failed','unknown'):
                 if fresh_history:
                     backlog.append((epoch(row['updated_at']) or epoch(row['created_at']) or 0, 1, row['key']))
@@ -250,6 +326,9 @@ class Store:
                 self.index_message(identifier)
             else:
                 self.index_send(identifier)
+        if self.remote:
+            with self.db:
+                self.db.execute("INSERT INTO metadata VALUES('bridge_schema','version','postgres-v1') ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value")
 
     @staticmethod
     def identity(raw, user_id):
@@ -282,22 +361,22 @@ class Store:
                 profile = self.profile(row['scene'],row['chat_id'],user)
                 profile.update(sender)
                 profile.update(scene=row['scene'],chat_id=row['chat_id'],updated_at=item.get('received_at') or item.get('timestamp'))
-                self.db.execute('INSERT OR REPLACE INTO profiles VALUES(?,?,?,?)',(row['scene'],row['chat_id'],user,json.dumps(profile)))
-            self.db.execute("INSERT OR IGNORE INTO history(scene,chat_id,direction,inbound_seq) VALUES(?,?,'in',?)",(row['scene'],row['chat_id'],seq))
+                self.db.execute('INSERT INTO profiles VALUES(?,?,?,?) ON CONFLICT(scene,chat_id,user_id) DO UPDATE SET payload=excluded.payload',(row['scene'],row['chat_id'],user,json.dumps(profile)))
+            self.db.execute("INSERT INTO history(scene,chat_id,direction,inbound_seq) VALUES(?,?,'in',?) ON CONFLICT(inbound_seq) DO NOTHING",(row['scene'],row['chat_id'],seq))
             index = _message_reference_index(item)
             if index is not None:
-                self.db.execute('INSERT OR IGNORE INTO reference_lookup VALUES(?,?,?,?,NULL)',
+                self.db.execute('INSERT INTO reference_lookup VALUES(?,?,?,?,NULL) ON CONFLICT(scene,chat_id,reference_index) DO NOTHING',
                                 (row['scene'],row['chat_id'],index,seq))
 
     def index_send(self, key):
         route = self.db.execute('SELECT scene,chat_id FROM send_routes WHERE key=?',(key,)).fetchone()
         if route and route['scene'] and route['chat_id']:
             with self.db:
-                self.db.execute("INSERT OR IGNORE INTO history(scene,chat_id,direction,send_key) VALUES(?,?,'out',?)",(*route,key))
+                self.db.execute("INSERT INTO history(scene,chat_id,direction,send_key) VALUES(?,?,'out',?) ON CONFLICT(send_key) DO NOTHING",(*route,key))
                 send = self.db.execute('SELECT status,result FROM sends WHERE key=?',(key,)).fetchone()
                 index = _send_reference_index(json.loads(send['result'])) if send and send['status']=='sent' and send['result'] else None
                 if index is not None:
-                    self.db.execute('INSERT OR IGNORE INTO reference_lookup VALUES(?,?,?,NULL,?)',
+                    self.db.execute('INSERT INTO reference_lookup VALUES(?,?,?,NULL,?) ON CONFLICT(scene,chat_id,reference_index) DO NOTHING',
                                     (*route,index,key))
 
     def reply_count(self, seq):
@@ -347,15 +426,17 @@ class Store:
 
     def set_group_info(self, chat, payload):
         with self.db:
-            self.db.execute("INSERT OR REPLACE INTO metadata VALUES('group_info',?,?)",(chat,json.dumps(payload)))
+            self.db.execute("INSERT INTO metadata VALUES('group_info',?,?) ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value",(chat,json.dumps(payload)))
 
     def get_session(self, app_id):
+        if self.remote and not self.initialized:
+            return (None, None)
         row = self.db.execute("SELECT value FROM metadata WHERE namespace=? AND key='ws_session'", (app_id,)).fetchone()
         return tuple(json.loads(row[0])) if row else (None, None)
 
     def set_session(self, app_id, sid, seq):
         with self.db:
-            self.db.execute("INSERT OR REPLACE INTO metadata VALUES(?,'ws_session',?)", (app_id,json.dumps([sid,seq])))
+            self.db.execute("INSERT INTO metadata VALUES(?,'ws_session',?) ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value", (app_id,json.dumps([sid,seq])))
 
     @staticmethod
     def safe_filename(value):
@@ -389,7 +470,7 @@ class Store:
         item.setdefault('content', '')
         item.setdefault('attachments', [])
         with self.db:
-            self.db.execute('INSERT OR IGNORE INTO messages(message_id,scene,chat_id,payload) VALUES(?,?,?,?)',
+            self.db.execute('INSERT INTO messages(message_id,scene,chat_id,payload) VALUES(?,?,?,?) ON CONFLICT(scene,chat_id,message_id) DO NOTHING',
                 (item['message_id'],item['scene'],item['chat_id'],json.dumps(item)))
         seq = self.db.execute('SELECT seq FROM messages WHERE scene=? AND chat_id=? AND message_id=?',
             (item['scene'], item['chat_id'],item['message_id'])).fetchone()[0]
@@ -635,93 +716,173 @@ def create_app(cfg=None, backend=None):
     if min(cfg.max_file,cfg.max_request,cfg.max_media,cfg.media_ttl)<=0 or cfg.send_interval<0 or any(v<=0 for v in cfg.windows.values()):
         raise RuntimeError('invalid bridge limits')
     store = Store(cfg)
+    owner = DatabaseOwner(store.db)
     if backend is None:
         from .sdk import OfficialBackend
         backend = OfficialBackend(store)
 
+    def fail_queued(key, error):
+        with store.db:
+            store.db.execute("UPDATE sends SET status='failed',error=?,updated_at=? WHERE key=?",
+                             (error, iso(), key))
+        store.set_send_stage(key, 'validate')
+        store.index_send(key)
+
+    def next_queued(cleanup):
+        require_database()
+        if cleanup:
+            store.cleanup()
+        # Expire queued routes even while the gateway is offline.
+        for queued in store.db.execute("SELECT key,payload FROM sends WHERE status='queued'").fetchall():
+            try:
+                validate_route(store, json.loads(queued['payload']))
+            except HTTPException:
+                fail_queued(queued['key'], 'queued route expired or unavailable')
+        row = store.db.execute("SELECT * FROM sends WHERE status='queued' ORDER BY created_at,key LIMIT 1").fetchone()
+        return (dict(row), getattr(store.db, 'generation', None)) if row else (None, None)
+
+    def claim_send(row, generation):
+        require_database(generation)
+        current = store.db.execute('SELECT status FROM sends WHERE key=?', (row['key'],)).fetchone()
+        if not current or current[0] != 'queued':
+            return None
+        body = json.loads(row['payload'])
+        try:
+            route = validate_route(store, body)
+        except HTTPException as exc:
+            fail_queued(row['key'], exc.detail)
+            return None
+        with store.db:
+            store.db.execute("UPDATE sends SET status='sending',updated_at=? WHERE key=?", (iso(), row['key']))
+            details = store.db.execute('SELECT msg_seq FROM send_details WHERE key=?', (row['key'],)).fetchone()
+            body['_msg_seq'] = details[0] if details else None
+            store.set_send_stage(row['key'], 'send')
+        return body, route
+
+    def finish_send(key, generation, status, error, result, stage=None, details=None):
+        require_database(generation)
+        with store.db:
+            store.db.execute('UPDATE sends SET status=?,error=?,result=?,updated_at=? WHERE key=?',
+                             (status, error, json.dumps(result, default=str) if result is not None else None, iso(), key))
+            if stage is not None:
+                store.set_send_stage(key, stage, details)
+            elif status in ('sent', 'unknown'):
+                store.set_send_stage(key, status)
+            store.index_send(key)
+
     async def worker():
-        last_send = 0.0
-        last_cleanup = 0.0
+        last_send = last_cleanup = 0.0
         while True:
             try:
-                if time.monotonic()-last_cleanup >= 30:
-                    store.cleanup()
+                cleanup = time.monotonic()-last_cleanup >= 30
+                row, generation = await store.call(next_queued, cleanup)
+                if cleanup:
                     last_cleanup = time.monotonic()
-                # Expire every queued job even if the gateway is offline.
-                for queued in store.db.execute("SELECT key,payload FROM sends WHERE status='queued'").fetchall():
-                    try:
-                        validate_route(store,json.loads(queued['payload']))
-                    except HTTPException:
-                        with store.db:
-                            store.db.execute("UPDATE sends SET status='failed',error='queued route expired or unavailable',updated_at=? WHERE key=?",(iso(),queued['key']))
-                        store.set_send_stage(queued['key'],'validate')
-                        store.index_send(queued['key'])
-                row = store.db.execute("SELECT * FROM sends WHERE status='queued' ORDER BY rowid LIMIT 1").fetchone()
                 if row is None or not backend.api_ready or not backend.connected:
-                    await asyncio.sleep(.1)
+                    await asyncio.sleep(1 if store.remote else .1)
                     continue
-                body = json.loads(row['payload'])
-                try:
-                    route = validate_route(store, body)
-                except HTTPException as exc:
-                    with store.db:
-                        store.db.execute("UPDATE sends SET status='failed',error=?,updated_at=? WHERE key=?",(exc.detail,iso(),row['key']))
+                # Revalidate and claim together after the asynchronous rate wait.
+                await asyncio.sleep(max(0, cfg.send_interval-(time.monotonic()-last_send)))
+                claimed = await store.call(claim_send, row, generation)
+                if claimed is None:
                     continue
-                # One serial worker, global spacing; never automatically retry API writes.
-                await asyncio.sleep(max(0,cfg.send_interval-(time.monotonic()-last_send)))
+                body, route = claimed
+                status, error, result, stage, details = 'unknown', None, None, None, None
                 try:
-                    route = validate_route(store, body)  # recheck expiry after rate wait
-                except HTTPException as exc:
-                    with store.db:
-                        store.db.execute("UPDATE sends SET status='failed',error=?,updated_at=? WHERE key=?",(exc.detail,iso(),row['key']))
-                    continue
-                with store.db:
-                    store.db.execute("UPDATE sends SET status='sending',updated_at=? WHERE key=?",(iso(),row['key']))
-                status, error, result = 'unknown', None, None
-                try:
-                    details = store.db.execute('SELECT msg_seq FROM send_details WHERE key=?',(row['key'],)).fetchone()
-                    body['_msg_seq'] = details[0] if details else None
-                    store.set_send_stage(row['key'],'send')
-                    result = await asyncio.wait_for(backend.send(body, route),60)
+                    # Never retry a backend write, including uncertain outcomes.
+                    result = await asyncio.wait_for(backend.send(body, route), 60)
                     status = 'sent'
                 except StageFailure as exc:
                     store.report_error(exc.stage, exc)
-                    store.set_send_stage(row['key'],exc.stage,exc.details)
+                    stage, details = exc.stage, exc.details
                     status = 'unknown' if exc.uncertain else 'failed'
                     error = exc.reason or 'platform operation failed'
                 except asyncio.CancelledError:
-                    with store.db:
-                        store.db.execute("UPDATE sends SET status='unknown',error='send interrupted',updated_at=? WHERE key=?",(iso(),row['key']))
-                    raise
+                    try:
+                        await store.call(finish_send, row['key'], generation, 'unknown', 'send interrupted', None)
+                    finally:
+                        raise asyncio.CancelledError()
                 except Exception as exc:
                     store.report_error('send', exc)
                     error = 'send outcome uncertain; do not blindly resend'
                 last_send = time.monotonic()
-                with store.db:
-                    store.db.execute('UPDATE sends SET status=?,error=?,result=?,updated_at=? WHERE key=?',
-                        (status,error,json.dumps(result,default=str) if result is not None else None,iso(),row['key']))
-                store.index_send(row['key'])
-                if status == 'sent':
-                    store.set_send_stage(row['key'],'sent')
+                await store.call(finish_send, row['key'], generation, status, error, result, stage, details)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 store.report_error('worker', exc)
-                # Keep HTTP service alive; no payload/credential logging.
                 await asyncio.sleep(1)
+
+    def initialize_owned():
+        if not owner.check():
+            raise DatabaseOwnershipLost()
+        store.initialize()
+
+    def release_runtime(acquired):
+        store.initialized = False
+        owner.release()
+        if acquired:
+            store.db.reset_session()
+
+    async def ownership_watchdog():
+        while True:
+            await asyncio.sleep(1)
+            if not await store.call(owner.check):
+                raise DatabaseOwnershipLost()
+
+    async def remote_runtime():
+        # Render can overlap the old and new containers. Only one owner runs the
+        # gateway, startup recovery and sender; the replacement remains live.
+        while True:
+            running = []
+            acquired = False
+            try:
+                if not await store.call(owner.try_acquire):
+                    await asyncio.sleep(1)
+                    continue
+                acquired = True
+                await store.call(initialize_owned)
+                if hasattr(backend, 'app_id'):
+                    backend.session = await store.call(store.get_session, backend.app_id)
+                running = [asyncio.create_task(worker()), asyncio.create_task(backend.run()),
+                           asyncio.create_task(ownership_watchdog())]
+                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                store.report_error('database', exc)
+            finally:
+                for task in running:
+                    task.cancel()
+                try:
+                    if running:
+                        await asyncio.gather(*running, return_exceptions=True)
+                        await backend.close()
+                finally:
+                    await store.call(release_runtime, acquired)
+            await asyncio.sleep(1)
 
     @asynccontextmanager
     async def lifespan(app):
-        task = asyncio.create_task(worker())
-        gateway = asyncio.create_task(backend.run())
+        if store.remote:
+            tasks = [asyncio.create_task(remote_runtime())]
+        else:
+            tasks = [asyncio.create_task(worker()), asyncio.create_task(backend.run())]
         try:
             yield
         finally:
-            task.cancel()
-            gateway.cancel()
-            await asyncio.gather(task,gateway,return_exceptions=True)
-            await backend.close()
-            store.db.close()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+            try:
+                await backend.close()
+            finally:
+                try:
+                    await store.call(owner.release)
+                finally:
+                    await store.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     from fastapi.exceptions import RequestValidationError
@@ -731,13 +892,38 @@ def create_app(cfg=None, backend=None):
 
     app.add_middleware(RequestLimit, limit=cfg.max_request, token=cfg.token)
     app.state.store, app.state.backend = store, backend
+    app.state.database_owner = owner
 
     async def auth(request: Request):
         supplied = request.headers.get('authorization','')
         if not secrets.compare_digest(supplied.encode(), ('Bearer '+cfg.token).encode()):
             raise HTTPException(401,'unauthorized',headers={'WWW-Authenticate':'Bearer'})
+    def require_database(generation=None):
+        if not store.remote:
+            return
+        if not owner.active or not store.initialized or (generation is not None and store.db.generation != generation):
+            raise HTTPException(503, 'database ownership changed; retry request')
+        try:
+            if not owner.check():
+                raise DatabaseOwnershipLost()
+        except (DatabaseError, DatabaseOwnershipLost):
+            raise HTTPException(503, 'database temporarily unavailable') from None
+
+    async def database_ready(request: Request):
+        if not store.remote or request.url.path == '/v1/status':
+            return
+        await store.call(require_database)
+
+    @app.exception_handler(DatabaseError)
+    async def safe_database_error(request, exc):
+        return JSONResponse({'detail':'database temporarily unavailable'},503)
+
+    @app.exception_handler(DatabaseOwnershipLost)
+    async def safe_owner_error(request, exc):
+        return JSONResponse({'detail':'database ownership changed'},503)
+
     from fastapi import APIRouter
-    api = APIRouter(prefix='/v1',dependencies=[Depends(auth)])
+    api = APIRouter(prefix='/v1',dependencies=[Depends(auth), Depends(database_ready)])
 
     @app.get('/health')
     async def health():
@@ -745,99 +931,145 @@ def create_app(cfg=None, backend=None):
 
     @api.get('/status')
     async def status():
-        counts = dict(store.db.execute('SELECT status,COUNT(*) FROM sends GROUP BY status').fetchall())
-        return {'connected':backend.connected,'api_ready':backend.api_ready,
-                'reconnecting':backend.reconnecting,'sends':counts,'last_error':store.last_error,
-                'queue_depth':counts.get('queued',0),'current_send':dict(current) if (current := store.db.execute("SELECT s.key,d.stage FROM sends s LEFT JOIN send_details d ON s.key=d.key WHERE s.status='sending' LIMIT 1").fetchone()) else None,
-                'proactive':True,'proactive_denied':sorted(cfg.proactive_deny)}
+        def read():
+            storage = {'backend':'postgresql' if store.remote else 'sqlite',
+                       'active':owner.active and store.initialized}
+            if store.remote and not storage['active']:
+                return {'connected':False,'api_ready':False,'reconnecting':True,
+                        'storage':storage,'sends':{},'queue_depth':0,'current_send':None,
+                        'last_error':store.last_error}
+            if store.remote:
+                try:
+                    if not owner.check():
+                        raise DatabaseOwnershipLost()
+                except (DatabaseError, DatabaseOwnershipLost):
+                    return {'connected':False,'api_ready':False,'reconnecting':True,
+                            'storage':{'backend':'postgresql','active':False},'sends':{},
+                            'queue_depth':0,'current_send':None,'last_error':{'stage':'database','type':'unavailable'}}
+            counts = dict(store.db.execute('SELECT status,COUNT(*) FROM sends GROUP BY status').fetchall())
+            return {'connected':backend.connected,'api_ready':backend.api_ready,
+                    'reconnecting':backend.reconnecting,'storage':storage,'sends':counts,'last_error':store.last_error,
+                    'queue_depth':counts.get('queued',0),'current_send':dict(current) if (current := store.db.execute("SELECT s.key,d.stage FROM sends s LEFT JOIN send_details d ON s.key=d.key WHERE s.status='sending' LIMIT 1").fetchone()) else None,
+                    'proactive':True,'proactive_denied':sorted(cfg.proactive_deny)}
+        return await store.call(read)
 
     @api.get('/messages')
     async def messages(after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),scene: str|None=None,
                        chat_id: str|None=None,detail: Detail='full'):
-        page = store.messages(after,limit,scene,chat_id)
-        return views.lean_page(page,scene,chat_id) if detail=='lite' else page
+        def read():
+            require_database()
+            page = store.messages(after,limit,scene,chat_id)
+            return views.lean_page(page,scene,chat_id) if detail=='lite' else page
+        return await store.call(read)
 
     @api.post('/messages/{seq}/ack')
     async def ack(seq: int):
-        store.message(seq)
-        with store.db:
-            store.db.execute('UPDATE messages SET acked=1 WHERE seq=?',(seq,))
-        return {'seq':seq,'acked':True}
+        def read():
+            require_database()
+            store.message(seq)
+            with store.db:
+                store.db.execute('UPDATE messages SET acked=1 WHERE seq=?',(seq,))
+            return {'seq':seq,'acked':True}
+        return await store.call(read)
 
     @api.get('/sessions')
     async def sessions(detail: Detail='full'):
-        rows = store.db.execute('SELECT scene,chat_id,MAX(seq) last_seq,COUNT(*) message_count FROM messages GROUP BY scene,chat_id ORDER BY last_seq DESC').fetchall()
-        items = {(r['scene'],r['chat_id']):dict(r) for r in rows}
-        for route in store.db.execute('SELECT DISTINCT scene,chat_id FROM send_routes WHERE scene IS NOT NULL AND chat_id IS NOT NULL'):
-            items.setdefault(tuple(route),dict(scene=route[0],chat_id=route[1],last_seq=0,message_count=0))
-        for allowed in cfg.authorized:
-            if ':' in allowed:
-                scene, chat = allowed.split(':',1)
-                items.setdefault((scene,chat),dict(scene=scene,chat_id=chat,last_seq=0,message_count=0))
-        for (scene,chat), item in items.items():
-            profiles = [json.loads(r[0]) for r in store.db.execute('SELECT payload FROM profiles WHERE scene=? AND chat_id=?',(scene,chat))]
-            item.update(proactive_allowed=store.proactive(scene,chat),names=[dict(user_id=p['user_id'],username=p.get('username'),name_source=p.get('name_source','official_event')) for p in profiles])
-            if scene == 'group':
-                # Populated from the official group-info endpoint when permitted.
-                item['group'] = store.group_info(chat)
-        values = list(items.values())
-        if detail=='lite':
-            return {'items':[views.lean_session(item) for item in values]}
-        return {'items':values}
+        def read():
+            require_database()
+            rows = store.db.execute('SELECT scene,chat_id,MAX(seq) last_seq,COUNT(*) message_count FROM messages GROUP BY scene,chat_id ORDER BY last_seq DESC').fetchall()
+            items = {(r['scene'],r['chat_id']):dict(r) for r in rows}
+            for route in store.db.execute('SELECT DISTINCT scene,chat_id FROM send_routes WHERE scene IS NOT NULL AND chat_id IS NOT NULL'):
+                items.setdefault(tuple(route),dict(scene=route[0],chat_id=route[1],last_seq=0,message_count=0))
+            for allowed in cfg.authorized:
+                if ':' in allowed:
+                    scene, chat = allowed.split(':',1)
+                    items.setdefault((scene,chat),dict(scene=scene,chat_id=chat,last_seq=0,message_count=0))
+            for (scene,chat), item in items.items():
+                profiles = [json.loads(r[0]) for r in store.db.execute('SELECT payload FROM profiles WHERE scene=? AND chat_id=?',(scene,chat))]
+                item.update(proactive_allowed=store.proactive(scene,chat),names=[dict(user_id=p['user_id'],username=p.get('username'),name_source=p.get('name_source','official_event')) for p in profiles])
+                if scene == 'group':
+                    # Populated from the official group-info endpoint when permitted.
+                    item['group'] = store.group_info(chat)
+            values = list(items.values())
+            if detail=='lite':
+                return {'items':[views.lean_session(item) for item in values]}
+            return {'items':values}
+        return await store.call(read)
 
     @api.get('/sessions/{scene}/{chat_id}/messages')
     async def history(scene: str,chat_id: str,after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),
                       detail: Detail='full'):
-        page = store.messages(after,limit,scene,chat_id)
-        return views.lean_page(page,scene,chat_id) if detail=='lite' else page
+        def read():
+            require_database()
+            page = store.messages(after,limit,scene,chat_id)
+            return views.lean_page(page,scene,chat_id) if detail=='lite' else page
+        return await store.call(read)
 
     @api.get('/capabilities')
     async def capabilities(detail: Detail='full'):
-        caps = {'features':{'media_url':True,'profiles':True,'session_history':True,'manual_profile_alias':False,
-                            'platform_asr':True,'proactive':True,'quote_receive':True,'quote_send':True},
-                'scenes':{scene:{'reply_window_seconds':cfg.windows[scene],'max_replies':cfg.reply_limits[scene],
-                                  'platform_max_replies':HARD_REPLIES[scene] if scene in ('c2c','group') else None,
-                                  'text':True,'markdown':scene in ('c2c','group'),
-                                  'media_kinds':['image','video','voice','file'] if scene in ('c2c','group') else []} for scene in SCENES},
-                'limits':{'max_file_bytes':cfg.max_file,'max_request_bytes':cfg.max_request,'max_media_bytes':cfg.max_media,'max_inline_media_bytes':4*1024*1024,'media_ttl_seconds':cfg.media_ttl},
-                'proactive':True,'proactive_denied':sorted(cfg.proactive_deny),
-                'media_url':{'https_only':True,'allowed_hosts':sorted(cfg.media_url_hosts),'platform_fetch':True},
-                'cursor_semantics':{'messages':'inbound_seq','session_history':'history_seq'}}
-        return views.lean_capabilities(caps) if detail=='lite' else caps
+        def read():
+            require_database()
+            caps = {'features':{'media_url':True,'profiles':True,'session_history':True,'manual_profile_alias':False,
+                                'platform_asr':True,'proactive':True,'quote_receive':True,'quote_send':True},
+                    'scenes':{scene:{'reply_window_seconds':cfg.windows[scene],'max_replies':cfg.reply_limits[scene],
+                                      'platform_max_replies':HARD_REPLIES[scene] if scene in ('c2c','group') else None,
+                                      'text':True,'markdown':scene in ('c2c','group'),
+                                      'media_kinds':['image','video','voice','file'] if scene in ('c2c','group') else []} for scene in SCENES},
+                    'limits':{'max_file_bytes':cfg.max_file,'max_request_bytes':cfg.max_request,'max_media_bytes':cfg.max_media,'max_inline_media_bytes':4*1024*1024,'media_ttl_seconds':cfg.media_ttl},
+                    'proactive':True,'proactive_denied':sorted(cfg.proactive_deny),
+                    'media_url':{'https_only':True,'allowed_hosts':sorted(cfg.media_url_hosts),'platform_fetch':True},
+                    'cursor_semantics':{'messages':'inbound_seq','session_history':'history_seq'}}
+            return views.lean_capabilities(caps) if detail=='lite' else caps
+        return await store.call(read)
 
     @api.get('/profiles')
     async def profiles(scene: str|None=None,chat_id: str|None=None,user_id: str|None=None,
                        limit: int=Query(50,ge=1,le=200),offset: int=Query(0,ge=0)):
-        sql, args = 'SELECT payload FROM profiles WHERE 1=1', []
-        for key,value in (('scene',scene),('chat_id',chat_id),('user_id',user_id)):
-            if value is not None:
-                sql += ' AND '+key+'=?'
-                args.append(value)
-        items = [json.loads(r[0]) for r in store.db.execute(sql+' ORDER BY scene,chat_id,user_id LIMIT ? OFFSET ?',args+[limit,offset])]
-        return {'items':items,'limit':limit,'offset':offset}
+        def read():
+            require_database()
+            sql, args = 'SELECT payload FROM profiles WHERE 1=1', []
+            for key,value in (('scene',scene),('chat_id',chat_id),('user_id',user_id)):
+                if value is not None:
+                    sql += ' AND '+key+'=?'
+                    args.append(value)
+            items = [json.loads(r[0]) for r in store.db.execute(sql+' ORDER BY scene,chat_id,user_id LIMIT ? OFFSET ?',args+[limit,offset])]
+            return {'items':items,'limit':limit,'offset':offset}
+        return await store.call(read)
 
     @api.get('/profiles/{scene}/{chat_id}/{user_id}')
     async def profile(scene: str,chat_id: str,user_id: str):
-        if not store.db.execute('SELECT 1 FROM profiles WHERE scene=? AND chat_id=? AND user_id=?',(scene,chat_id,user_id)).fetchone():
-            raise HTTPException(404,'profile not found')
-        return store.profile(scene,chat_id,user_id)
+        def read():
+            require_database()
+            if not store.db.execute('SELECT 1 FROM profiles WHERE scene=? AND chat_id=? AND user_id=?',(scene,chat_id,user_id)).fetchone():
+                raise HTTPException(404,'profile not found')
+            return store.profile(scene,chat_id,user_id)
+        return await store.call(read)
 
     @api.get('/sessions/{scene}/{chat_id}/history')
     async def session_history(scene: str,chat_id: str,after: int=Query(0,ge=0),limit: int=Query(50,ge=1,le=200),
                               direction: Literal['all','in','out']='all',detail: Detail='full'):
-        page = store.session_history(scene,chat_id,after,limit,direction)
-        return views.lean_page(page,scene,chat_id) if detail=='lite' else page
+        def read():
+            require_database()
+            page = store.session_history(scene,chat_id,after,limit,direction)
+            return views.lean_page(page,scene,chat_id) if detail=='lite' else page
+        return await store.call(read)
 
     @api.post('/media',status_code=201)
     async def upload(file: UploadFile=File(...)):
+        generation = getattr(store.db, 'generation', None)
         # Serialize admission + writes so concurrent uploads cannot exceed the disk budget.
         async with store.upload_lock:
-            store.cleanup()
+            def admission():
+                require_database(generation)
+                store.cleanup()
+                return store.media_usage()
+            used = await store.call(admission)
             media_id = secrets.token_hex(16)
             path = store.media_dir/media_id
             part = store.media_dir/(media_id+'.part')
-            size, used = 0, store.media_usage()
+            size = 0
             store.active_parts.add(part)
+            committed = False
             try:
                 with part.open('xb') as target:
                     while chunk := await file.read(65536):
@@ -851,14 +1083,20 @@ def create_app(cfg=None, backend=None):
                     raise HTTPException(422,'empty file')
                 expires = time.time()+cfg.media_ttl
                 part.rename(path)
-                with store.db:
-                    store.db.execute('INSERT INTO media VALUES(?,?,?)',(media_id,size,expires))
-                    store.db.execute('INSERT INTO media_names VALUES(?,?)',
-                        (media_id,store.safe_filename(file.filename)))
+                def write_media():
+                    nonlocal committed
+                    require_database(generation)
+                    with store.db:
+                        store.db.execute('INSERT INTO media VALUES(?,?,?)', (media_id, size, expires))
+                        store.db.execute('INSERT INTO media_names VALUES(?,?)',
+                                         (media_id, store.safe_filename(file.filename)))
+                    committed = True
+                await store.call(write_media)
                 return {'media_id':media_id,'size':size,'expires_at':iso(expires)}
             except BaseException:
                 part.unlink(missing_ok=True)
-                path.unlink(missing_ok=True)
+                if not committed:
+                    path.unlink(missing_ok=True)
                 raise
             finally:
                 store.active_parts.discard(part)
@@ -866,45 +1104,65 @@ def create_app(cfg=None, backend=None):
 
     @api.post('/messages/send')
     async def enqueue(body: SendRequest, detail: Detail='full'):
+        generation = getattr(store.db, 'generation', None)
         payload = body.model_dump()
         encoded = json.dumps(payload,sort_keys=True,separators=(',',':'))
         fp = hashlib.sha256(encoded.encode()).hexdigest()
-        row = store.db.execute('SELECT fingerprint,payload FROM sends WHERE key=?',(body.idempotency_key,)).fetchone()
-        if row:
-            old = json.loads(row['payload'])
-            compatible = all(old.get(k)==v for k,v in payload.items()) and all(payload.get(k)==v for k,v in old.items())
-            if row[0]!=fp and not compatible:
-                raise HTTPException(409,'idempotency key already used for different request')
-            return JSONResponse(_send_view(store.send_record(body.idempotency_key),detail),202)
-        route = validate_route(store,payload)
+        def existing_record():
+            row = store.db.execute('SELECT fingerprint,payload FROM sends WHERE key=?', (body.idempotency_key,)).fetchone()
+            if row:
+                old = json.loads(row['payload'])
+                compatible = all(old.get(k) == v for k, v in payload.items()) and all(payload.get(k) == v for k, v in old.items())
+                if row['fingerprint'] != fp and not compatible:
+                    raise HTTPException(409, 'idempotency key already used for different request')
+                return JSONResponse(_send_view(store.send_record(body.idempotency_key), detail), 202)
+
+        def prepare():
+            require_database(generation)
+            existing = existing_record()
+            if existing is not None:
+                return existing
+            validate_route(store, payload)
+
+        existing = await store.call(prepare)
+        if existing is not None:
+            return existing
         if body.media_url:
             try:
-                await validate_public_media_url(body.media_url,cfg.media_url_hosts)
+                await validate_public_media_url(body.media_url, cfg.media_url_hosts)
             except ValueError:
-                raise HTTPException(422,'media URL validation failed') from None
-        existing = store.db.execute('SELECT fingerprint,payload FROM sends WHERE key=?',(body.idempotency_key,)).fetchone()
-        if existing:
-            old = json.loads(existing['payload'])
-            if existing['fingerprint'] != fp and not (all(old.get(k)==v for k,v in payload.items()) and all(payload.get(k)==v for k,v in old.items())):
-                raise HTTPException(409,'idempotency key already used for different request')
-            return JSONResponse(_send_view(store.send_record(body.idempotency_key),detail),202)
-        if body.reply_to:
-            # Include unknown/failed reservations conservatively; explicit manual review is required.
-            count = store.reply_count(body.reply_to)
-            if count>=cfg.reply_limits[route[0]]:
-                raise HTTPException(409,'reply quota reserved or exhausted')
-        now = iso()
-        with store.db:
-            store.db.execute('INSERT INTO sends VALUES(?,?,?,?,?,?,?,?)',
-                (body.idempotency_key,fp,encoded,'queued',now,now,None,None))
-            store.db.execute('INSERT INTO send_routes VALUES(?,?,?,?)',(body.idempotency_key,route[0],route[1],body.reply_to))
-            store.db.execute('INSERT INTO send_details VALUES(?,?,?,NULL)',(body.idempotency_key,'queued',count+1 if body.reply_to else None))
-        return JSONResponse(_send_view(store.send_record(body.idempotency_key),detail),202)
+                raise HTTPException(422, 'media URL validation failed') from None
+
+        def finish():
+            require_database(generation)
+            with store.db:
+                existing = existing_record()
+                if existing is not None:
+                    return existing
+                # Awaiting URL validation (or executor admission) can change the
+                # route, deadline, quota or ownership. Validate again atomically.
+                route = validate_route(store, payload)
+                count = store.reply_count(body.reply_to) if body.reply_to else 0
+                if body.reply_to and count >= cfg.reply_limits[route[0]]:
+                    raise HTTPException(409, 'reply quota reserved or exhausted')
+                now = iso()
+                store.db.execute('INSERT INTO sends VALUES(?,?,?,?,?,?,?,?)',
+                                 (body.idempotency_key, fp, encoded, 'queued', now, now, None, None))
+                store.db.execute('INSERT INTO send_routes VALUES(?,?,?,?)',
+                                 (body.idempotency_key, route[0], route[1], body.reply_to))
+                store.db.execute('INSERT INTO send_details VALUES(?,?,?,NULL)',
+                                 (body.idempotency_key, 'queued', count+1 if body.reply_to else None))
+            return JSONResponse(_send_view(store.send_record(body.idempotency_key), detail), 202)
+
+        return await store.call(finish)
 
     @api.get('/sends/{key}')
     async def send_status(key: str,detail: Detail='full'):
-        record = store.send_record(key)
-        return views.lean_send(record) if detail=='lite' else record
+        def read():
+            require_database()
+            record = store.send_record(key)
+            return views.lean_send(record) if detail=='lite' else record
+        return await store.call(read)
 
     app.include_router(api)
     return app

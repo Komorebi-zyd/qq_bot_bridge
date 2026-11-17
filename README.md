@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6E56CF)
 ![Tools](https://img.shields.io/badge/tools-12-2ea44f)
-![Tests](https://img.shields.io/badge/tests-163%20passed-2ea44f)
+![Tests](https://img.shields.io/badge/tests-236%20passed-2ea44f)
 ![Deploy](https://img.shields.io/badge/deploy-single%20container-0b7285)
 ![Official](https://img.shields.io/badge/route-official%20Bot%20API-e8590c)
 
@@ -207,6 +207,7 @@ BRIDGE_ALLOWED_HOSTS=你的域名
 |---|---|---|
 | `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | 是 | 官方机器人凭据 |
 | `BRIDGE_API_TOKEN` | 是 | MCP的访问密钥 |
+| `BRIDGE_DATABASE_URL` | 否 | PostgreSQL 连接串，留空使用本地 SQLite |
 | `BRIDGE_ALLOWED_HOSTS` | 用域名时 | MCP 允许的 Host，精确匹配；默认只允许 localhost |
 | `BRIDGE_ALLOWED_ORIGINS` | 否 | 客户端发 `Origin` 头时需要匹配 |
 | `BRIDGE_PROACTIVE_DENY` | 否 | 主动发送黑名单，留空即全开 |
@@ -214,6 +215,24 @@ BRIDGE_ALLOWED_HOSTS=你的域名
 | `BRIDGE_GROUP_FULL_MESSAGES` | 否 | 群全量消息，需平台权限 |
 | `BRIDGE_REPLY_WINDOW_C2C` 等 | 否 | 分场景回复窗口，默认私聊 3600 秒、群 300 秒 |
 | `BRIDGE_MAX_REPLIES_C2C` 等 | 否 | 分场景回复次数，默认私聊 4 次、群 5 次 |
+
+### 远程数据库 / Render
+
+在平台私密环境变量里设置：
+
+```dotenv
+BRIDGE_DATABASE_URL=postgres://dbuser:YOUR_PASSWORD@db.example.com:10586/QQdb?sslmode=require
+```
+
+`postgres://` 和 `postgresql://` 均可。数据库需要预先创建，表由桥自动创建；数据库用户需要建表和读写权限。保留服务商给出的 TLS 参数，密码中的 `@`、`#`、`%` 等 URI 特殊字符使用百分号编码。
+
+配置后，收到的消息、处理标记、发送队列与幂等记录、昵称和群资料、引用索引、网关恢复状态都写入 PostgreSQL。重新部署连接同一个数据库，继续使用原来的 `seq` 和发送 key。`qq_status.storage` 显示存储后端和当前实例是否处于活动状态。
+
+`BRIDGE_DATABASE_URL` 留空时继续使用 `/data/bridge.sqlite3`。已填写但连接失败会返回数据库错误，配置的远程库是唯一数据源。切换存储后端会使用目标库现有数据，旧 SQLite 数据不自动导入。
+
+Render 滚动部署期间，数据库锁保证只有一个实例接收与发送 QQ 消息，新实例等待旧实例退出后接管。`/health` 继续作为存活检查。服务使用一个副本、一个 worker，连接地址使用 PostgreSQL 直连或会话级连接池。
+
+上传文件的**字节内容**仍在本地 `/data/media`；数据库保存的是记录。Render 临时磁盘重新部署后，旧 `media_id` 的文件需重新上传；图片、视频等优先使用 `media_url` 直链。
 
 完整清单见 [.env.example](.env.example)。
 
@@ -241,7 +260,9 @@ python -m venv .venv
 .venv\Scripts\python -m pytest -q
 ```
 
-163 项离线测试，覆盖官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、错误码解析、标记清洗与引用收发。不需要真实凭据，不向 QQ 发消息。
+236 项测试，覆盖 SQLite、PostgreSQL、官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、引用收发与滚动交接。PostgreSQL 集成测试使用独立测试库，QQ 后端使用模拟实现。
+
+默认执行 SQLite 与驱动单元测试；在独立测试数据库上设置 `BRIDGE_TEST_POSTGRES_URL` 后执行 PostgreSQL 集成测试。测试会创建随机 schema 并写入模拟数据。GitHub Actions 已配置 PostgreSQL 17 服务运行完整测试。
 
 ---
 

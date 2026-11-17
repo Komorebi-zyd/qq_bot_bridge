@@ -105,13 +105,20 @@ class OfficialBackend:
         self.session = store.get_session(self.app_id)
         self.last_seen = time.monotonic()
         self.bot_ids = set()
+        self._inbound_tasks = set()
+        self._session_tasks = set()
+        self._background_tasks = set()
         self.full = os.getenv('BRIDGE_GROUP_FULL_MESSAGES','false').lower()=='true'
 
     async def on_message(self, event_type, raw):
+        task = asyncio.current_task()
+        self._inbound_tasks.add(task)
         try:
             await self._observe_message(event_type, raw)
         except Exception as exc:
             self.store.report_error('inbound', exc)
+        finally:
+            self._inbound_tasks.discard(task)
 
     async def _observe_message(self, event_type, raw):
         if not isinstance(raw, dict) or (raw.get('author') or {}).get('bot'):
@@ -162,7 +169,9 @@ class OfficialBackend:
                     uid = next((mention[k] for k in ('user_id','user_openid','member_openid','id') if mention.get(k)), '')
                     mentions.append({**self.store.identity(mention,uid),'source':'sdk_event'})
         if event.chat_scope == 'group':
-            asyncio.create_task(self._load_group_info(event.chat_id))
+            task = asyncio.create_task(self._load_group_info(event.chat_id))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_done)
         own_index, _ = parse_reference_metadata(raw)
         elements = sanitize_elements(raw['msg_elements'] if 'msg_elements' in raw else json_safe(event.msg_elements))
         quote = normalize_inbound_quote(raw)
@@ -179,7 +188,7 @@ class OfficialBackend:
             'reference_index':own_index,'event_type':event_type}
         if quote is not None:
             item['quote'] = quote
-        self.store.observe(item)
+        await self._store_call(self.store.observe, item)
 
     async def _load_group_info(self, chat_id):
         """Fetch the group name once per conversation.
@@ -187,20 +196,20 @@ class OfficialBackend:
         The endpoint is documented as whitelist-only, so a rejection is cached as
         unavailable instead of being retried on every message.
         """
-        if self.store.group_info(chat_id) or not self.api:
+        if not self.api or await self._store_call(self.store.group_info, chat_id):
             return
         try:
             data = await asyncio.wait_for(
                 self.api.request(Route('GET','/v2/groups/{group_id}/info',group_id=chat_id)),15)
         except Exception as exc:
             self.store.report_error('group_info', exc)
-            self.store.set_group_info(chat_id, {'unavailable': True})
+            await self._store_call(self.store.set_group_info, chat_id, {'unavailable': True})
             return
         if not isinstance(data, dict):
-            self.store.set_group_info(chat_id, {'unavailable': True})
+            await self._store_call(self.store.set_group_info, chat_id, {'unavailable': True})
             return
         info = {k:data.get(k) for k in ('group_name','group_finger_memo','group_class_text','group_tags','group_member_num') if data.get(k) is not None}
-        self.store.set_group_info(chat_id, info or {'unavailable': True})
+        await self._store_call(self.store.set_group_info, chat_id, info or {'unavailable': True})
 
     def ready(self, ready):
         user = getattr(ready,'user',None)
@@ -215,11 +224,31 @@ class OfficialBackend:
     def offline(self):
         self.connected, self.reconnecting = False, True
 
+    async def _store_call(self, function, *args):
+        if hasattr(self.store, 'call'):
+            return await self.store.call(function, *args)
+        return function(*args)
+
+    def _background_done(self, task):
+        self._background_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self.store.report_error('group_info', task.exception())
+
+    def _session_done(self, task):
+        self._session_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self.store.report_error('session', task.exception())
+
     def session_set(self, sid, seq):
         # SDK advances seq before dispatch/persistence. Resume survives restart, but this
         # is NOT an atomic event+cursor commit and cannot guarantee no lost events.
-        self.store.set_session(self.app_id, sid, seq)
         self.session = (sid,seq)
+        if getattr(self.store, 'remote', False):
+            task = asyncio.create_task(self._store_call(self.store.set_session, self.app_id, sid, seq))
+            self._session_tasks.add(task)
+            task.add_done_callback(self._session_done)
+        else:
+            self.store.set_session(self.app_id, sid, seq)
 
     def fatal(self, code, message):
         self.store.report_error('gateway_fatal')
@@ -298,38 +327,38 @@ class OfficialBackend:
         if scene in ('guild','dm') and body['markdown']:
             raise Rejected('guild/dm markdown unavailable')
         key = body.get('idempotency_key')
-        def stage(value):
+        async def stage(value):
             if key:
-                self.store.set_send_stage(key,value)
-        def quote_index():
+                await self._store_call(self.store.set_send_stage, key,value)
+        async def quote_index():
             from .core import resolve_quote
             try:
-                return resolve_quote(self.store, body, scene, chat_id)
+                return await self._store_call(resolve_quote, self.store, body, scene, chat_id)
             except HTTPException:
                 raise StageFailure('validate', reason='quote target unavailable or invalid') from None
         # Fail before any upload; resolve again immediately before sending because
         # media upload may take time and a stored target may have changed.
-        quote_index()
+        await quote_index()
         msg_seq = body.get('_msg_seq') or (1 if reply_id else QQApiClient.next_msg_seq())
         if body.get('media_id') or body.get('media_url'):
-            stage('validate')
+            await stage('validate')
             try:
                 if body.get('media_url'):
                     source = await validate_public_media_url(body['media_url'], self.store.cfg.media_url_hosts)
                     filename = self.store.safe_filename(body.get('filename')) if body.get('filename') else None
                 else:
-                    source = str(self.store.media_path(body['media_id']).resolve())
-                    filename = self.store.safe_filename(body['filename']) if body.get('filename') else self.store.media_filename(body['media_id'],body['media_kind'])
+                    source = str((await self._store_call(self.store.media_path, body['media_id'])).resolve())
+                    filename = self.store.safe_filename(body['filename']) if body.get('filename') else await self._store_call(self.store.media_filename, body['media_id'],body['media_kind'])
             except Exception:
                 raise StageFailure('validate') from None
-            stage('upload')
+            await stage('upload')
             kinds = {'image':MEDIA_TYPE_IMAGE,'video':MEDIA_TYPE_VIDEO,'voice':MEDIA_TYPE_VOICE,'file':MEDIA_TYPE_FILE}
             file_type = kinds[body['media_kind']]
             token = await self._upload_media(scene,chat_id,source,file_type,filename,is_url=bool(body.get('media_url')))
-            stage('validate')
+            await stage('validate')
             from .core import validate_route
             try:
-                validate_route(self.store,body)
+                await self._store_call(validate_route, self.store,body)
             except HTTPException:
                 raise StageFailure('validate') from None
             msg = MessageToCreate(content=body['text'],msg_type=7,msg_seq=msg_seq,msg_id=reply_id or '',media=MediaInfo(file_info=token))
@@ -338,10 +367,10 @@ class OfficialBackend:
             if body['markdown']:
                 msg.msg_type, msg.content = 2, ''
                 msg.markdown = MarkdownContent(content=body['text'])
-        index = quote_index()
+        index = await quote_index()
         if index is not None:
             msg.message_reference = MessageReference(message_id=index)
-        stage('send')
+        await stage('send')
         try:
             if scene=='c2c':
                 return await self.api.post_c2c_message(chat_id,msg)
@@ -388,6 +417,13 @@ class OfficialBackend:
     async def close(self):
         if self.ws:
             await self.ws.stop()
+        for task in list(self._inbound_tasks):
+            task.cancel()
+        await asyncio.gather(*list(self._inbound_tasks), return_exceptions=True)
+        for task in list(self._background_tasks):
+            task.cancel()
+        await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+        await asyncio.gather(*list(self._session_tasks), return_exceptions=True)
         if self.http:
             await self.http.aclose()
         self.connected = self.api_ready = self.reconnecting = False

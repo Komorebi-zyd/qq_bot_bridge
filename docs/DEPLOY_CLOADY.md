@@ -60,3 +60,19 @@ BRIDGE_ALLOWED_ORIGINS=https://qq-bridge.example.com,http://localhost:8080,http:
 - `/data` 包含聊天归档和会话恢复状态，应限制平台成员访问并备份。不要删除持久卷排错。
 - 若免费平台休眠/停止容器，停止期间接收能力受影响；能否补发由官方平台决定，不能保证无丢消息。
 - 本地当前未完成 Docker 构建：检测到 Docker CLI，但 Docker Desktop Linux 引擎未运行。已通过 Compose 语法校验和离线协议测试，线上网络/权限/富媒体仍须部署后验收。
+
+## 外接 PostgreSQL（含 Render）
+
+私密环境变量可选设置：
+
+```dotenv
+BRIDGE_DATABASE_URL=postgresql://dbuser:YOUR_PASSWORD@db.example.com:5432/qqbridge?sslmode=require
+```
+
+- `postgres://` 同样适用，使用服务商提供的 SSL 参数；特殊字符密码按 URI 编码。
+- 数据库提前创建，应用自动建表。一个数据库供一台机器人桥使用，应用账号具有建表与读写权限。
+- 直连或会话级池支持实例交接锁。实例数和 Uvicorn worker 数仍设为 1。
+- 环境变量留空走本地 SQLite；填写后使用 PostgreSQL，连接失败报告错误。
+- Render 健康检查路径是 `/health`。`qq_status.storage` 显示活动后端，滚动更新期间新实例等待接管。
+- `/data/media` 的上传文件仍需本地持久卷。Render 临时磁盘可搭配 `media_url`，部署前上传的旧文件需重新上传。
+- 原 SQLite 数据不会自动导入，远程库保存从启用该连接后的记录。
