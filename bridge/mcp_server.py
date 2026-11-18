@@ -75,7 +75,7 @@ def attach_mcp(app):
     @mcp.tool(structured_output=False)
     async def qq_get_messages(after: int = 0, limit: int = 20, scene: Scene | None = None,
             chat_id: str | None = None, detail: Detail = 'lite') -> dict[str, Any]:
-        """按游标读取新消息，含发言人、正文、引用上下文、附件链接与回复状态。after 为上次 next_cursor。detail=lite 精简，full 返回原始字段。"""
+        """按游标读取新消息，含发言人、正文、引用上下文、附件链接与回复状态。after 为上次 next_cursor。默认 lite，full 返回完整字段；头像按需用 qq_get_info 查询。"""
         params = {'after': after, 'limit': limit, 'detail': detail}
         params.update({k: v for k, v in {'scene': scene, 'chat_id': chat_id}.items() if v is not None})
         return await request('GET', '/v1/messages', params=params)
@@ -87,13 +87,13 @@ def attach_mcp(app):
 
     @mcp.tool(structured_output=False)
     async def qq_list_sessions(detail: Detail = 'lite') -> dict[str, Any]:
-        """列出会话、群名、成员与主动联系状态。"""
+        """列出会话、群名和已观察到的发言人。"""
         return await request('GET', '/v1/sessions', params={'detail': detail})
 
     @mcp.tool(structured_output=False)
     async def qq_get_session_messages(scene: Scene, chat_id: str, after: int = 0, limit: int = 20,
             detail: Detail = 'lite') -> dict[str, Any]:
-        """分页读取指定会话收到的消息，含发言人、正文和附件链接。"""
+        """分页读取指定会话收到的消息，含发言人、正文、引用与附件链接。头像按需用 qq_get_info 查询。"""
         return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/messages',
                              params={'after': after, 'limit': limit, 'detail': detail})
 
@@ -148,9 +148,17 @@ def attach_mcp(app):
         return await request('GET', f'/v1/profiles/{scene}/{quote(chat_id, safe="")}/{quote(user_id, safe="")}')
 
     @mcp.tool(structured_output=False)
+    async def qq_get_info(scene: Scene, chat_id: str, user_id: str | None = None) -> dict[str, Any]:
+        """按需查看缓存资料和可用头像。私聊传 scene=c2c 与 chat_id；群资料传 scene=group 与 chat_id；查群成员再传消息 from.id 作为 user_id。"""
+        params = {'scene': scene, 'chat_id': chat_id}
+        if user_id is not None:
+            params['user_id'] = user_id
+        return await request('GET', '/v1/info', params=params)
+
+    @mcp.tool(structured_output=False)
     async def qq_get_session_history(scene: Scene, chat_id: str, after: int = 0, limit: int = 20,
             direction: Literal['all', 'in', 'out'] = 'all', detail: Detail = 'lite') -> dict[str, Any]:
-        """分页浏览会话的双向记录，含收到与已发出的内容。after 使用历史 next_cursor。"""
+        """分页浏览会话的双向记录，after 使用历史 next_cursor。头像按需用 qq_get_info 查询。"""
         return await request('GET', f'/v1/sessions/{scene}/{quote(chat_id, safe="")}/history',
                              params={'after': after, 'limit': limit, 'direction': direction, 'detail': detail})
 

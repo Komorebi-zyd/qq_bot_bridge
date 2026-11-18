@@ -9,6 +9,7 @@ there is a single source of truth.
 import base64
 import json
 import re
+from urllib.parse import urlsplit
 
 MENTION_ALL = re.compile(r'<@all>', re.I)
 MENTION_ID = re.compile(r'<@([0-9A-Za-z]+)>')
@@ -79,6 +80,42 @@ def lean_attachment(item):
     return out
 
 
+def avatar_url(value):
+    """Use only the supplied avatar URL; an OpenID is not a URL source."""
+    if not isinstance(value, str) or not value or any(ch.isspace() for ch in value):
+        return None
+    if value.startswith('//'):
+        value = 'https:' + value
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme in ('http', 'https') and parsed.hostname and parsed.username is None:
+            return value
+    except ValueError:
+        pass
+    return None
+
+
+def info_view(scene, chat_id, profile=None, group=None):
+    out = {'scene': scene, 'chat_id': chat_id}
+    if profile is not None:
+        out['user_id'] = profile['user_id']
+        fields = (('username', 'name'), ('member_role', 'role'), ('bot', 'bot'), ('updated_at', 'updated_at'))
+        source = profile
+    else:
+        source = group or {}
+        out['info_status'] = ('unavailable' if source.get('unavailable') else 'cached') if group is not None else 'not_cached'
+        fields = (('group_name', 'name'), ('group_member_num', 'member_count'),
+                  ('group_finger_memo', 'description'), ('group_class_text', 'category'), ('group_tags', 'tags'))
+    for key, alias in fields:
+        value = source.get(key)
+        if value is not None and value != '' and value != []:
+            out[alias] = value
+    avatar = avatar_url(source.get('avatar'))
+    if avatar:
+        out['avatar'] = avatar
+    return out
+
+
 def lean_sender(record):
     """Merge the message snapshot and the cached profile into one object."""
     profile = record.get('sender_profile') or {}
@@ -86,13 +123,10 @@ def lean_sender(record):
     out = {'id': record.get('user_id')}
     name = profile.get('username') or snapshot.get('username')
     role = profile.get('member_role') or snapshot.get('member_role')
-    avatar = profile.get('avatar') or snapshot.get('avatar')
     if name:
         out['name'] = name
     if role:
         out['role'] = role
-    if avatar:
-        out['avatar'] = avatar
     return out
 
 

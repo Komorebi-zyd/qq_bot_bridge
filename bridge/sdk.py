@@ -15,6 +15,7 @@ from qqbot_agent_sdk.api_client import Route
 from qqbot_agent_sdk.dto import MessageToCreate, GuildMessageToCreate, MediaInfo, MarkdownContent, MessageReference
 from qqbot_agent_sdk.media_loader import MediaUploader
 from .core import Rejected, StageFailure
+from .views import avatar_url
 from .quotes import parse_reference_metadata, normalize_inbound_quote, sanitize_elements
 from .uploader import UploadError, download_media, upload_by_url, upload_local_copy
 from .media_url import validate_public_media_url
@@ -209,6 +210,12 @@ class OfficialBackend:
             await self._store_call(self.store.set_group_info, chat_id, {'unavailable': True})
             return
         info = {k:data.get(k) for k in ('group_name','group_finger_memo','group_class_text','group_tags','group_member_num') if data.get(k) is not None}
+        # Accept an explicit URL if present in a group-info response. The
+        # documented response does not currently promise an avatar field.
+        for key in ('group_avatar_url', 'group_avatar', 'avatar'):
+            if avatar := avatar_url(data.get(key)):
+                info['avatar'] = avatar
+                break
         await self._store_call(self.store.set_group_info, chat_id, info or {'unavailable': True})
 
     def ready(self, ready):

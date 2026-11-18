@@ -45,7 +45,7 @@ BRIDGE_ALLOWED_ORIGINS=https://qq-bridge.example.com,http://localhost:8080,http:
 1. 存活检查设为 **GET `/health`**。此接口无需鉴权，不代表 QQ 已在线。
 2. 带 `Authorization: Bearer <BRIDGE_API_TOKEN>` 请求 **`/v1/status`**，核对 `connected/api_ready` 与脱敏 `last_error`。
 3. Agent MCP 类型选择 **Streamable HTTP / 远程 HTTP**，URL 填 **`https://你的域名/mcp`**，请求头为同一个 Bearer token。
-4. 成功列出 `qq_status` 等 12 个工具后，再测试拉消息。
+4. 成功列出 `qq_status` 等 13 个工具后，再测试拉消息。
 5. 真人从获准的 QQ 会话发送一条测试消息，Agent 调 `qq_get_messages(after=0)`，核对文本与附件 URL。
 6. 实际发送测试需主人明确授权，提交后查询 `qq_get_send_result`；`queued` 不是发送成功。
 

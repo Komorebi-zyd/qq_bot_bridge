@@ -333,10 +333,13 @@ class Store:
     @staticmethod
     def identity(raw, user_id):
         result = {'user_id':user_id,'qq_number':None,'name_source':'official_event'}
-        for key in ('username','member_role','bot','avatar'):
+        for key in ('username','member_role','bot'):
             value = raw.get(key)
             if (key == 'bot' and type(value) is bool) or (key != 'bot' and isinstance(value,(str,int)) and not isinstance(value,bool)):
                 result[key] = value
+        avatar = views.avatar_url(raw.get('avatar'))
+        if avatar:
+            result['avatar'] = avatar
         if raw.get('username_source') in ('raw_event','sdk_event'):
             result['username_source'] = raw['username_source']
         return result
@@ -346,9 +349,12 @@ class Store:
         # The bridge only honours an explicit, opt-in deny list.
         return f'{scene}:{chat}' not in self.cfg.proactive_deny
 
-    def profile(self, scene, chat, user):
+    def find_profile(self, scene, chat, user):
         row = self.db.execute('SELECT payload FROM profiles WHERE scene=? AND chat_id=? AND user_id=?',(scene,chat,user)).fetchone()
-        return json.loads(row[0]) if row else self.identity({},user)
+        return json.loads(row[0]) if row else None
+
+    def profile(self, scene, chat, user):
+        return self.find_profile(scene, chat, user) or self.identity({},user)
 
     def index_message(self, seq):
         row = self.db.execute('SELECT * FROM messages WHERE seq=?',(seq,)).fetchone()
@@ -1040,9 +1046,32 @@ def create_app(cfg=None, backend=None):
     async def profile(scene: str,chat_id: str,user_id: str):
         def read():
             require_database()
-            if not store.db.execute('SELECT 1 FROM profiles WHERE scene=? AND chat_id=? AND user_id=?',(scene,chat_id,user_id)).fetchone():
+            profile = store.find_profile(scene,chat_id,user_id)
+            if profile is None:
                 raise HTTPException(404,'profile not found')
-            return store.profile(scene,chat_id,user_id)
+            return profile
+        return await store.call(read)
+
+    @api.get('/info')
+    async def qq_info(scene: Literal['c2c','group','guild','dm'], chat_id: str=Query(min_length=1, max_length=256),
+                      user_id: str | None=Query(None, min_length=1, max_length=256)):
+        def read():
+            require_database()
+            if scene == 'group' and user_id is None:
+                group = store.group_info(chat_id)
+                if group is None and f'group:{chat_id}' not in cfg.authorized and not (
+                    store.db.execute("SELECT 1 FROM messages WHERE scene='group' AND chat_id=? LIMIT 1",(chat_id,)).fetchone()
+                    or store.db.execute("SELECT 1 FROM send_routes WHERE scene='group' AND chat_id=? LIMIT 1",(chat_id,)).fetchone()
+                ):
+                    raise HTTPException(404,'group conversation not found')
+                return views.info_view(scene,chat_id,group=group)
+            if user_id is None and scene != 'c2c':
+                raise HTTPException(422,'user_id is required for this scene')
+            user = chat_id if user_id is None else user_id
+            profile = store.find_profile(scene,chat_id,user)
+            if profile is None:
+                raise HTTPException(404,'profile not found')
+            return views.info_view(scene,chat_id,profile=profile)
         return await store.call(read)
 
     @api.get('/sessions/{scene}/{chat_id}/history')

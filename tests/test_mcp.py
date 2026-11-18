@@ -26,7 +26,7 @@ TOKEN = 'offline-test-token-0123456789'
 AUTH = {'Authorization': 'Bearer ' + TOKEN}
 TOOLS = {'qq_status', 'qq_get_messages', 'qq_ack_message', 'qq_list_sessions',
          'qq_get_session_messages', 'qq_send_message', 'qq_get_send_result', 'qq_upload_media',
-         'qq_get_capabilities', 'qq_get_profiles', 'qq_get_profile', 'qq_get_session_history'}
+         'qq_get_capabilities', 'qq_get_profiles', 'qq_get_profile', 'qq_get_session_history', 'qq_get_info'}
 
 
 class Fake:
@@ -104,7 +104,7 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
         attachment = {'url': 'https://cdn.example/real.png', 'content_type': 'image/jpeg',
                       'filename': 'real.jpg', 'size': 1234, 'voice_wav_url': 'https://cdn.example/voice.wav'}
         seq = app.state.store.observe(dict(message_id='incoming', scene='c2c', chat_id='user',
-            user_id='user', content='hello', sender={'username':'Tester'}, attachments=[attachment], timestamp=iso(),
+            user_id='user', content='hello', sender={'username':'Tester','avatar':'https://cdn.example/avatar.png'}, attachments=[attachment], timestamp=iso(),
             reference_index='REFIDX_incoming'))
         server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False))
         task = asyncio.create_task(server.serve(sockets=[sock]))
@@ -150,8 +150,13 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         assert first['attachments'][0]['url'] == attachment['url']
                         assert 'message_id' not in first and 'sender_profile' not in first
                         assert 'reply_remaining_seconds' not in first
-                        assert 'sender_profile' in (await http.get(
+                        assert 'avatar' not in first['from']
+                        full = (await http.get(
                             f'http://{host}/v1/messages?limit=1&scene=c2c&chat_id=user&detail=full')).json()['items'][0]
+                        assert full['sender_profile']['avatar'] == 'https://cdn.example/avatar.png'
+                        info = await call('qq_get_info', {'scene': 'c2c', 'chat_id': 'user'})
+                        assert info == (await http.get(f'http://{host}/v1/info?scene=c2c&chat_id=user')).json()
+                        assert info['name'] == 'Tester' and info['avatar'] == full['sender_profile']['avatar']
 
                         assert await call('qq_get_session_messages', {'scene': 'c2c', 'chat_id': 'user'}) == messages
                         assert (await call('qq_list_sessions'))['items'][0]['id'] == 'user'
@@ -221,7 +226,17 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         assert qo['status']=='sent' and fake.calls[-1][0]['quote_key']=='mcp-turn'
 
 
+                        store = app.state.store
+                        store.observe(dict(message_id='group-profile', scene='group', chat_id='group',
+                            user_id='member', content='hello group', sender={'username':'Member',
+                            'avatar':'https://cdn.example/member.png'}, timestamp=iso()))
+                        store.set_group_info('group', {'group_name':'Book club', 'group_member_num':12})
+                        group_info = await call('qq_get_info', {'scene':'group', 'chat_id':'group'})
+                        assert group_info['name'] == 'Book club' and 'avatar' not in group_info
+                        member_info = await call('qq_get_info', {'scene':'group','chat_id':'group','user_id':'member'})
+                        assert member_info['avatar'] == 'https://cdn.example/member.png'
                         invalid = [
+                            ('qq_get_info', {'scene':'group','chat_id':'group','user_id':'unknown'}),
                             ('qq_get_messages', {'limit': 201}),
                             ('qq_send_message', {**send, 'text': 'different'}),
                             ('qq_send_message', {'idempotency_key': 'empty', 'reply_to': seq, 'text': '   '}),

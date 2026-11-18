@@ -128,7 +128,7 @@ def test_postgres_streamable_mcp_persists_across_app_restart(tmp_path, pg_url, m
 
                         seq = await app.state.store.call(app.state.store.observe, dict(
                             message_id='postgres-inbound', scene='c2c', chat_id='user', user_id='user',
-                            content='persist me', sender={'username': 'Tester'}, timestamp=iso(),
+                            content='persist me', sender={'username': 'Tester', 'avatar':'https://cdn.example/user.png'}, timestamp=iso(),
                             reference_index='REFIDX_postgres_inbound'))
                         messages = await call('qq_get_messages', {'scene': 'c2c', 'chat_id': 'user'})
                         assert messages['items'][0]['seq'] == seq
@@ -163,6 +163,9 @@ def test_postgres_streamable_mcp_persists_across_app_restart(tmp_path, pg_url, m
                         history = await call('qq_get_session_history', {'scene': 'c2c', 'chat_id': 'user'})
                         assert [item['direction'] for item in history['items']] == ['in','out']
                         assert history['items'][0]['seq']==seq
+                        assert 'avatar' not in history['items'][0]['from']
+                        info = await call('qq_get_info', {'scene':'c2c','chat_id':'user'})
+                        assert info['avatar'] == 'https://cdn.example/user.png'
                         assert history['items'][1]['key']==body['idempotency_key']
                         assert history['items'][1]['quote_to']==seq
                         replay = await call('qq_send_message', body)

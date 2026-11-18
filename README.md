@@ -6,8 +6,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6E56CF)
-![Tools](https://img.shields.io/badge/tools-12-2ea44f)
-![Tests](https://img.shields.io/badge/tests-236%20passed-2ea44f)
+![Tools](https://img.shields.io/badge/tools-13-2ea44f)
+![Tests](https://github.com/Komorebi-zyd/qq_bot_bridge/actions/workflows/tests.yml/badge.svg)
 ![Deploy](https://img.shields.io/badge/deploy-single%20container-0b7285)
 ![Official](https://img.shields.io/badge/route-official%20Bot%20API-e8590c)
 
@@ -39,14 +39,14 @@ QQ 用户  ←→  QQ 开放平台  ←→  这个容器  ←→  你的 Agent
 |---|---|
 | 私聊 / 群聊收发 | 文字、图片、视频、语音、文件 |
 | 主动联系 | 不用等你先说话，Agent 可以主动找你 |
-| 认识人 | 昵称、头像、群内角色；同名靠 ID 区分 |
-| 认识群 | 群名称、群人数、群成员列表 |
+| 认识人 | 昵称、群内角色；头像按需查，同名靠 ID 区分 |
+| 认识群 | 查看已缓存的群名称、简介、标签和人数 |
 | 双向历史 | 谁说过什么，双向可查，游标独立 |
 | 引用对话 | 读懂被引用的正文和附件，也能引用用户或机器人之前的消息 |
 | 媒体直链 | `media_url` 一句话发视频，不用 Base64 |
 | 自动回退 | 平台抓不到链接，桥自己下载后分片上传 |
 | 精确诊断 | 850026 是下载失败，850019 是格式不支持 |
-| 省流返回 | 单条消息 378 字符，是原始结构的 24% |
+| 省流返回 | 消息保留正文、身份和附件，头像等资料按需查询 |
 
 表情和 @ 会被翻译成人话：`<faceType=1,...>` → `[表情:大怨种]`，`<@9A30...>` → `[@Coconut]`。
 
@@ -77,7 +77,7 @@ URL：https://你的域名/mcp
 请求头：Authorization: Bearer <BRIDGE_API_TOKEN>
 ```
 
-刷新工具列表，看到 12 个 `qq_*` 工具就通了。先调 `qq_status` 确认 QQ 在线。
+刷新工具列表，看到 13 个 `qq_*` 工具就通了。先调 `qq_status` 确认 QQ 在线。
 
 详细步骤见 [cloady 部署](docs/DEPLOY_CLOADY.md)。
 
@@ -91,16 +91,17 @@ URL：https://你的域名/mcp
 | `qq_get_capabilities` | 可用场景、回复时限、媒体限额 |
 | `qq_get_messages` | 游标拉新消息 |
 | `qq_ack_message` | 标记已处理 |
-| `qq_list_sessions` | 会话、群名、成员 |
+| `qq_list_sessions` | 会话、群名、已观察到的发言人 |
 | `qq_get_session_messages` | 单会话消息 |
 | `qq_get_session_history` | 双向收发记录 |
 | `qq_get_profiles` | 按会话筛成员资料 |
-| `qq_get_profile` | 单个成员资料 |
+| `qq_get_profile` | 单个成员的完整缓存资料 |
+| `qq_get_info` | 按需查私聊对象、群成员或群资料，以及已缓存的头像 |
 | `qq_send_message` | 发文字 / URL 媒体 / 已上传文件 |
 | `qq_get_send_result` | 查询发送阶段与结果 |
 | `qq_upload_media` | 上传小文件换 media_id |
 
-所有工具默认 `detail=lite`，需要原始字段时传 `detail=full`。
+消息、会话等支持 `detail` 的工具默认返回 `lite`，需要原始字段时传 `detail=full`。
 
 ---
 
@@ -159,7 +160,7 @@ URL：https://你的域名/mcp
 {
   "seq": 13,
   "text": "[表情:大怨种]",
-  "from": { "id": "59F5…", "name": "蝉", "role": "member", "avatar": "https://…" },
+  "from": { "id": "59F5…", "name": "蝉", "role": "member" },
   "at": "2026-11-13T20:43:22+08:00",
   "can_reply": true,
   "replies_left": 5,
@@ -167,7 +168,17 @@ URL：https://你的域名/mcp
 }
 ```
 
-Agent 拿到就能判断：谁说的、说了什么、还来不来得及回。
+Agent 拿到就能判断：谁说的、说了什么、还来不来得及回。图片等消息附件的链接仍在 `attachments`。
+
+**按需查头像和资料**
+
+调用 `qq_get_info`，群成员使用消息里的 `from.id`：
+
+```json
+{"scene":"group","chat_id":"群 OpenID","user_id":"成员 OpenID"}
+```
+
+群资料只传 `scene: "group"` 和 `chat_id`；私聊对象用 `scene: "c2c"` 和 `chat_id`。头像字段 `avatar` 在缓存有实际 URL 时返回。QQ 官方的群基本信息接口目前列出的字段是群名、简介、分类、标签和人数，群头像随可用数据返回。
 
 ---
 
@@ -179,7 +190,7 @@ Agent 拿到就能判断：谁说的、说了什么、还来不来得及回。
 
 **媒体走平台原生 URL 上传。** 模型只提交直链，QQ 服务器自己取文件。平台取不到（850026）时，桥下载一份走分片上传再试一次——官方文档推荐的做法。
 
-**返回只给该给的。** `sender` 和 `sender_profile` 合并成一个 `from`，`message_id` 不返回（回复用 `seq`），空字段不输出，秒级倒计时换成绝对截止时间。一条消息从 1516 字符压到 378。
+**精简消息与资料分开。** `from` 保留发言人 ID、昵称与角色，头像由 `qq_get_info` 按需返回。回复用 `seq`，时效看 `reply_deadline`。
 
 **MCP 结果不重复。** 关掉结构化镜像，一份 JSON 只出现一次。
 
@@ -260,7 +271,7 @@ python -m venv .venv
 .venv\Scripts\python -m pytest -q
 ```
 
-236 项测试，覆盖 SQLite、PostgreSQL、官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、引用收发与滚动交接。PostgreSQL 集成测试使用独立测试库，QQ 后端使用模拟实现。
+测试覆盖 SQLite、PostgreSQL、官方 MCP 客户端 loopback 协议、旧库迁移、幂等重放、媒体回退、引用收发、资料查询与滚动交接。PostgreSQL 集成测试使用独立测试库，QQ 后端使用模拟实现。
 
 默认执行 SQLite 与驱动单元测试；在独立测试数据库上设置 `BRIDGE_TEST_POSTGRES_URL` 后执行 PostgreSQL 集成测试。测试会创建随机 schema 并写入模拟数据。GitHub Actions 已配置 PostgreSQL 17 服务运行完整测试。
 

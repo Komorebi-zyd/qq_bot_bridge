@@ -386,7 +386,8 @@ def test_group_info_cached_once(tmp_path):
         async def request(self,route):
             calls.append('info')
             return {'group_openid':'g','group_name':'读书分享会','group_finger_memo':'每周共读',
-                    'group_class_text':'文化','group_tags':['阅读'],'group_member_num':256,'secret':'ignore'}
+                    'group_class_text':'文化','group_tags':['阅读'],'group_member_num':256,
+                    'group_avatar_url':'//cdn.qq.com/group.png','secret':'ignore'}
     backend.api=API()
     async def scenario():
         await backend._load_group_info('g')
@@ -395,6 +396,7 @@ def test_group_info_cached_once(tmp_path):
     assert calls==['info']
     info=store.group_info('g')
     assert info['group_name']=='读书分享会' and info['group_member_num']==256
+    assert info['avatar']=='https://cdn.qq.com/group.png'
     assert 'secret' not in info and 'group_openid' not in info
     store.db.close()
 

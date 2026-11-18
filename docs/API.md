@@ -16,7 +16,8 @@
 | qq_get_session_messages | 会话收到的消息 | GET /v1/sessions/{scene}/{chat_id}/messages |
 | qq_get_session_history | 双向收发记录 | GET /v1/sessions/{scene}/{chat_id}/history |
 | qq_get_profiles | 分页查看资料缓存 | GET /v1/profiles |
-| qq_get_profile | 一位发言人的缓存资料 | GET /v1/profiles/{scene}/{chat_id}/{user_id} |
+| qq_get_profile | 一位发言人的完整缓存资料 | GET /v1/profiles/{scene}/{chat_id}/{user_id} |
+| qq_get_info | 按需查看群、群成员或私聊对象的缓存资料和头像 | GET /v1/info |
 | qq_send_message | 文字、URL 媒体、上传文件发送 | POST /v1/messages/send |
 | qq_get_send_result | 发送阶段与结果 | GET /v1/sends/{key} |
 | qq_upload_media | 标准 Base64 小文件上传 | POST /v1/media multipart |
@@ -31,20 +32,20 @@ lite 消息结构：
 
 ```json
 {"seq": 9, "text": "hi",
- "from": {"id": "...", "name": "Komorebi", "role": "owner", "avatar": "https://..."},
+ "from": {"id": "...", "name": "Komorebi", "role": "owner"},
  "at": "2026-11-13T17:54:38+08:00",
  "attachments": [{"kind": "image", "filename": "a.jpg", "url": "https://...", "size": 184616}],
  "can_reply": true, "replies_left": 5, "reply_deadline": "2026-11-13T09:59:38+00:00"}
 ```
 
-- `sender` 与 `sender_profile` 合并为 `from`，头像只出现一次。
+- `from` 保留 `id`、`name`、`role`。头像由 `qq_get_info` 按需返回，`full` 原有头像字段和消息附件 URL 保留。
 - 不再返回 `message_id`（回复用 `seq`）、`received_at`、`event_type`、`name_source`、`username_source` 等内部字段。
 - 空值字段不输出；`acked` 仅在已确认时出现。
 - 同一会话的 `scene`/`chat_id` 提升为响应级 `chat`，不再逐条重复。
 - 用 `reply_deadline` 判断时效，不再返回每次调用都变化的秒级倒计时，响应可稳定比较。
 - `qq_get_send_result` 精简为 `key/status/stage/msg_seq/error/codes`；`qq_get_capabilities` 只列可用场景。
 
-体积对比（同一台机器人实测）：纯文字消息 1516 → 378 字符（-76%），带图消息 1879 → 747（-61%）。
+头像 URL 长 127 字符时，200 条都带头像的消息仅链接就少 25,400 字符；紧凑 JSON 连同字段名和标点共少 27,800 字符。
 
 ## 消息与身份
 
@@ -62,6 +63,18 @@ lite 消息结构：
 `POST /v1/messages/{seq}/ack` 幂等返回 `{seq,acked:true}`，独立于发送和游标。处理完成后由 Agent 保存 next_cursor。
 
 `GET /v1/profiles?scene=group&chat_id=...&user_id=...&limit=50&offset=0` 按会话筛选自动积累的资料；`GET /v1/profiles/{scene}/{chat_id}/{user_id}` 查询指定成员。官方事件有名字时自动更新；独立的官方全群成员查询属内邀权限，基础资料接口读取本桥缓存。
+
+### 按需资料查询
+
+`qq_get_info` / `GET /v1/info` 使用相同参数：
+
+| 目标 | 参数 |
+|---|---|
+| 私聊对象 | `scene=c2c`、`chat_id` |
+| 群资料 | `scene=group`、`chat_id` |
+| 群成员 | `scene=group`、`chat_id`、`user_id`（消息 `from.id`） |
+
+用户资料返回 `scene`、`chat_id`、`user_id`，以及已缓存的 `name`、`role`、`avatar`、`bot`、`updated_at`。群资料返回 `info_status`：`cached`（已缓存）、`not_cached`（已知会话，尚无群资料）、`unavailable`（已记录查询不可用），并附可用的 `name`、`member_count`、`description`、`category`、`tags` 和 `avatar`。仅实际提供并缓存的头像 URL 才返回；[官方群基本信息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_info.get.html)目前未列出头像字段。查找限定在指定会话，未观察到的成员或未知会话返回 404。
 
 ## 会话与双向历史
 
