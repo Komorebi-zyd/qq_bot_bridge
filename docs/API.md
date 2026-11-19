@@ -49,6 +49,8 @@ lite 消息结构：
 
 ## 消息与身份
 
+群消息接收模式由 QQ 侧设置。开启「接收所有消息」的群可接收平台推送的 [`GROUP_MESSAGE_CREATE`](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html)；群 @ 消息走 `GROUP_AT_MESSAGE_CREATE`。两类事件共用 `GROUP_AND_C2C_EVENT` Intent。
+
 `GET /v1/messages?after=0&limit=50&scene=c2c&chat_id=...` 返回 `{items,next_cursor}`，scene/chat_id 可选，limit 1..200，after 排他。消息含：
 
 - `seq`、`message_id`、`scene`、`chat_id`、`user_id`、`content`、`timestamp`、`received_at`、`acked`。
@@ -163,7 +165,7 @@ MCP `qq_upload_media(filename,content_base64)` 标准Base64，解码最多4MiB�
 
 ### 主动联系
 
-`BRIDGE_PROACTIVE_SESSIONS=c2c:openid,group:group_openid` 为部署者的精确会话授权。QQ 客户端也需允许主动发送。Agent 的 heartbeat 决定何时调用，例如：
+主动发送由 QQ 侧权限决定。部署者可通过 `BRIDGE_PROACTIVE_DENY` 排除指定会话。Agent 的 heartbeat 决定何时调用，例如：
 
 ```json
 {"idempotency_key":"reminder-001","scene":"c2c","chat_id":"openid","text":"提醒内容"}

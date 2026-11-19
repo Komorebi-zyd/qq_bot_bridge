@@ -223,9 +223,12 @@ BRIDGE_ALLOWED_HOSTS=你的域名
 | `BRIDGE_ALLOWED_ORIGINS` | 否 | 客户端发 `Origin` 头时需要匹配 |
 | `BRIDGE_PROACTIVE_DENY` | 否 | 主动发送黑名单，留空即全开 |
 | `BRIDGE_MEDIA_URL_HOSTS` | 否 | 限定媒体域名，留空即公网 |
-| `BRIDGE_GROUP_FULL_MESSAGES` | 否 | 群全量消息，需平台权限 |
 | `BRIDGE_REPLY_WINDOW_C2C` 等 | 否 | 分场景回复窗口，默认私聊 3600 秒、群 300 秒 |
 | `BRIDGE_MAX_REPLIES_C2C` 等 | 否 | 分场景回复次数，默认私聊 4 次、群 5 次 |
+
+### 群消息接收
+
+在 QQ 侧为目标群的机器人选好消息接收模式。开启「接收所有消息」后，桥会保存 QQ 推送的群成员消息（`GROUP_MESSAGE_CREATE`），也照常处理 `GROUP_AT_MESSAGE_CREATE`。部署新版后，以群里一条新发的未 @ 机器人消息验证；旧版丢弃的事件不包含在归档里。此前的 `BRIDGE_GROUP_FULL_MESSAGES` 环境变量已不再使用。
 
 ### 远程数据库 / Render
 

@@ -330,34 +330,42 @@ def test_quote_serialization_and_bot_prefilter(tmp_path,monkeypatch):
     store.db.close()
 
 
-def test_full_group_parser_and_dispatch(tmp_path,monkeypatch):
+@pytest.mark.parametrize('legacy_flag',[None,'false'])
+def test_full_group_parser_and_dispatch(tmp_path,monkeypatch,legacy_flag):
+    from qqbot_agent_sdk.dto import DEFAULT_INTENTS
     from bridge.sdk import OfficialBackend, EventParser, BridgeWebSocket
+    # GROUP_MESSAGE_CREATE and GROUP_AT_MESSAGE_CREATE share the group/C2C intent.
+    assert DEFAULT_INTENTS & (1 << 25)
+    if legacy_flag is None:
+        monkeypatch.delenv('BRIDGE_GROUP_FULL_MESSAGES',raising=False)
+    else:
+        monkeypatch.setenv('BRIDGE_GROUP_FULL_MESSAGES',legacy_flag)
     handlers=dict(EventParser._EVENT_HANDLERS)
-    monkeypatch.setenv('BRIDGE_GROUP_FULL_MESSAGES','true')
     store=Store(Settings(data=tmp_path,token=TOKEN))
     backend=OfficialBackend(store)
     raw={'id':'full','timestamp':iso(),'group_openid':'g','author':{'member_openid':'member'},
-         'content':'  <@!bot> untouched  ','message_type':103,
+         'content':'  普通群消息  ','message_type':103,
          'attachments':[{'url':'//example.invalid/image','filename':'x.png'}],
          'msg_elements':[{'msg_idx':'q','content':'quoted','attachments':[{'filename':'q.txt'}]}]}
-    asyncio.run(backend.on_message('GROUP_MESSAGE_CREATE',raw))
+
+    class Callbacks:
+        on_message_event=backend.on_message
+
+    ws=BridgeWebSocket(Callbacks())
+    ws._dispatch_to_main=lambda coro:asyncio.run(coro)
+    ws._handle_dispatch('GROUP_MESSAGE_CREATE',raw)
     msg=store.messages(0,10)['items'][0]
     assert (msg['scene'],msg['chat_id'],msg['user_id'],msg['event_type'])==('group','g','member','GROUP_MESSAGE_CREATE')
-    assert msg['content']=='<@!bot> untouched'
+    assert msg['content']=='普通群消息'
     assert msg['attachments'][0]['url']=='https://example.invalid/image'
     assert msg['msg_elements'][0]['attachments'][0]['filename']=='q.txt'
     assert EventParser._EVENT_HANDLERS==handlers
-    asyncio.run(backend.on_message('GROUP_MESSAGE_CREATE',{**raw,'id':'missing','group_openid':''}))
-    monkeypatch.setenv('BRIDGE_GROUP_FULL_MESSAGES','false')
-    asyncio.run(OfficialBackend(store).on_message('GROUP_MESSAGE_CREATE',{**raw,'id':'disabled'}))
+    ws._handle_dispatch('GROUP_MESSAGE_CREATE',{**raw,'id':'missing','group_openid':''})
+    ws._handle_dispatch('GROUP_MESSAGE_CREATE',raw)
     assert len(store.messages(0,10)['items'])==1
-    class Callbacks:
-        on_message_event=backend.on_message
-    ws=BridgeWebSocket(Callbacks())
-    ws.full_messages=True
-    ws._dispatch_to_main=lambda coro:asyncio.run(coro)
-    ws._handle_dispatch('GROUP_MESSAGE_CREATE',{**raw,'id':'dispatch'})
-    assert len(store.messages(0,10)['items'])==2
+    ws._handle_dispatch('GROUP_AT_MESSAGE_CREATE',{**raw,'id':'at','content':'<@!bot> ping'})
+    assert [m['event_type'] for m in store.messages(0,10)['items']]==[
+        'GROUP_MESSAGE_CREATE','GROUP_AT_MESSAGE_CREATE']
     store.db.close()
 
 

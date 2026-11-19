@@ -35,8 +35,8 @@ BRIDGE_ALLOWED_ORIGINS=https://qq-bridge.example.com,http://localhost:8080,http:
 
 ## 可选开关
 
-- `BRIDGE_GROUP_FULL_MESSAGES=false`：获平台群全量消息权限并完成事件订阅后才设为 `true`。开关本身不申请权限。
-- `BRIDGE_PROACTIVE_SESSIONS=`：默认禁止主动发送。按需填写 `c2c:实际OpenID,group:实际群OpenID`，不是个人 QQ 号码。
+- 群消息接收模式在 QQ 侧为目标群设置；桥通过 `GROUP_MESSAGE_CREATE` 和 `GROUP_AT_MESSAGE_CREATE` 归档群成员消息。
+- `BRIDGE_PROACTIVE_DENY=`：可选主动发送排除项，使用逗号分隔的 `scene:chat_id`。留空时主动发送由 QQ 侧权限决定。
 - `BRIDGE_MEDIA_URL_HOSTS=`：使用公网 HTTPS 媒体直链，可按需指定自有 CDN 域名。
 - `BRIDGE_MAX_MEDIA_BYTES=268435456`：云端上传文件总保留上限 256MiB。单文件默认 20MiB；代理层可能更严格。
 

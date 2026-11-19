@@ -72,10 +72,10 @@ def parse_full(event_type, msg, content, raw):
 
 
 class BridgeWebSocket(QQWebSocket):
-    full_messages = False
-
     def _handle_dispatch(self, event_type, data):
-        if event_type in ('C2C_MESSAGE_CREATE','GROUP_AT_MESSAGE_CREATE','MESSAGE_CREATE','AT_MESSAGE_CREATE','DIRECT_MESSAGE_CREATE') or (event_type == 'GROUP_MESSAGE_CREATE' and self.full_messages):
+        # QQ's group receive settings decide which group events arrive.
+        if event_type in ('C2C_MESSAGE_CREATE', 'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE',
+                          'MESSAGE_CREATE', 'AT_MESSAGE_CREATE', 'DIRECT_MESSAGE_CREATE'):
             # DB uniqueness is authoritative; SDK in-memory dedup must not discard failed persistence.
             self._dispatch_to_main(self._cb.on_message_event(event_type,data))
             return
@@ -109,7 +109,6 @@ class OfficialBackend:
         self._inbound_tasks = set()
         self._session_tasks = set()
         self._background_tasks = set()
-        self.full = os.getenv('BRIDGE_GROUP_FULL_MESSAGES','false').lower()=='true'
 
     async def on_message(self, event_type, raw):
         task = asyncio.current_task()
@@ -125,8 +124,6 @@ class OfficialBackend:
         if not isinstance(raw, dict) or (raw.get('author') or {}).get('bot'):
             return
         if event_type == 'GROUP_MESSAGE_CREATE':
-            if not self.full:
-                return
             from qqbot_agent_sdk.dto import parse_message
             msg = parse_message(raw)
             event = parse_full(event_type, msg, msg.content.strip(), raw)
@@ -300,7 +297,6 @@ class OfficialBackend:
                 callbacks = self.callbacks()
                 self.ws = BridgeWebSocket(callbacks,log_tag='QQBridge')
                 self.ws.error_callback = self.store.report_error
-                self.ws.full_messages = self.full
                 # Same event loop avoids cross-thread SQLite/lifecycle races. SDK low-level runner
                 # creates/closes aiohttp session and handles its own bounded reconnect attempts.
                 self.ws._main_loop = asyncio.get_running_loop()

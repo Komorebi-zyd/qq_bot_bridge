@@ -226,10 +226,23 @@ def test_official_client_full_parity(tmp_path, monkeypatch):
                         assert qo['status']=='sent' and fake.calls[-1][0]['quote_key']=='mcp-turn'
 
 
+                        from bridge.sdk import BridgeWebSocket, OfficialBackend
                         store = app.state.store
-                        store.observe(dict(message_id='group-profile', scene='group', chat_id='group',
-                            user_id='member', content='hello group', sender={'username':'Member',
-                            'avatar':'https://cdn.example/member.png'}, timestamp=iso()))
+                        events = []
+                        backend = OfficialBackend(store)
+
+                        class Callbacks:
+                            on_message_event = backend.on_message
+
+                        ws = BridgeWebSocket(Callbacks())
+                        ws._dispatch_to_main = lambda coro: events.append(asyncio.create_task(coro))
+                        ws._handle_dispatch('GROUP_MESSAGE_CREATE', {'id':'group-profile', 'group_openid':'group',
+                            'content':'hello group', 'timestamp':iso(), 'author':{'member_openid':'member',
+                            'username':'Member', 'avatar':'https://cdn.example/member.png'}})
+                        await asyncio.gather(*events)
+                        await backend.close()
+                        group_messages = await call('qq_get_session_messages', {'scene':'group', 'chat_id':'group'})
+                        assert [item['text'] for item in group_messages['items']] == ['hello group']
                         store.set_group_info('group', {'group_name':'Book club', 'group_member_num':12})
                         group_info = await call('qq_get_info', {'scene':'group', 'chat_id':'group'})
                         assert group_info['name'] == 'Book club' and 'avatar' not in group_info
